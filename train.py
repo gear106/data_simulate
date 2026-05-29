@@ -26,7 +26,16 @@ def main(args):
     # 新任务微调：加载预训练权重，不恢复优化器状态
     if config.get('ckpt_path') is not None:
         ckpt = torch.load(config['ckpt_path'], map_location='cpu', weights_only=False)
-        model.load_state_dict(ckpt['state_dict'], strict=False)
+        state_dict = ckpt['state_dict']
+
+        # 先删除所有形状不匹配的键，避免 load_state_dict 报错
+        model_state = model.state_dict()
+        for k in list(state_dict.keys()):
+            if k in model_state and state_dict[k].shape != model_state[k].shape:
+                print(f"Skip loading {k}: checkpoint {tuple(state_dict[k].shape)} vs model {tuple(model_state[k].shape)}")
+                del state_dict[k]
+
+        model.load_state_dict(state_dict, strict=False)
 
         # 单独处理 task_embedding：预训练是3任务，微调是1任务（se），只取第0行
         if 'dnn.task_embedding.weight' in ckpt['state_dict']:
