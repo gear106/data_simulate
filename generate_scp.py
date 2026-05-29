@@ -1,109 +1,136 @@
-#!/usr/bin/env python3
-"""
-根据原始数据目录生成 simulation 所需的 .scp 与配套文件。
-
-使用方式:
-    python gen_data/generate_scp.py \
-        --speech_dir "D:/code/data/VoiceBank/clean" \
-        --noise_dir "D:/code/data/DEMAND" \
-        --rir_dir "D:/code/data/RIR/rirs_noises/real_rirs_isotropic_noises" \
-        --output_dir "data/train_sources" \
-        --speech_fs 16000 \
-        --noise_fs 16000 \
-        --rir_fs 16000
-"""
-
 import argparse
 from pathlib import Path
 
+AUDIO_EXTS = {'.wav', '.flac', '.mp3'}
 
-def make_scp(audio_dir, out_scp, fs, prefix="utt"):
-    """遍历目录下所有 wav 文件，生成三列 scp: uid fs path"""
-    audio_dir = Path(audio_dir)
-    with open(out_scp, "w", encoding="utf-8") as f:
-        i = 0
-        for wav_path in sorted(audio_dir.rglob("*.wav")):
-            uid = f"{prefix}_{i:05d}"
-            f.write(f"{uid} {fs} {wav_path}\n")
-            i += 1
-    return i
+
+def get_audio_files(directory):
+    """递归获取目录下所有音频文件，以 stem 为 utt_id"""
+    files = {}
+    dir_path = Path(directory)
+    if not dir_path.exists():
+        print(f"[Warning] directory not found: {directory}")
+        return files
+    for ext in AUDIO_EXTS:
+        for p in dir_path.rglob(f'*{ext}'):
+            utt = p.stem
+            if utt in files:
+                print(f"[Warning] duplicate utt_id '{utt}' found:")
+                print(f"  existing: {files[utt]}")
+                print(f"  new:      {p}")
+            else:
+                files[utt] = p.resolve()
+    return files
+
+
+def infer_spk(path, root):
+    """尝试从目录的相对路径推断 speaker，默认 unknown"""
+    try:
+        rel = path.relative_to(root)
+        parts = rel.parts
+        if len(parts) > 1:
+            return parts[0]
+    except ValueError:
+        pass
+    return 'unknown'
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate scp files for urgent2026 simulation"
+        description="从 clean/noisy/rir 目录生成 SCP 文件，支持单独指定任意一种或多种，自动检查 clean/noisy 配对"
     )
-    parser.add_argument(
-        "--speech_dir", required=True, help="干净语音根目录，会递归搜索 .wav"
-    )
-    parser.add_argument(
-        "--noise_dir", required=True, help="噪声根目录，会递归搜索 .wav"
-    )
-    parser.add_argument(
-        "--rir_dir", required=True, help="RIR 根目录，会递归搜索 .wav"
-    )
-    parser.add_argument(
-        "--output_dir", default="data/train_sources", help="输出目录"
-    )
-    parser.add_argument("--speech_fs", type=int, default=16000, help="语音采样率")
-    parser.add_argument("--noise_fs", type=int, default=16000, help="噪声采样率")
-    parser.add_argument("--rir_fs", type=int, default=16000, help="RIR 采样率")
+    parser.add_argument('--clean_dir',
+                        help='Clean 音频目录（生成 speech.scp / clean.scp）')
+    parser.add_argument('--noisy_dir',
+                        help='Noisy 音频目录（生成 mix.scp），与 clean 同时提供时会做配对检查')
+    parser.add_argument('--rir_dir',
+                        help='RIR 音频目录（生成 rir.scp）')
+    parser.add_argument('--out_dir', required=True,
+                        help='SCP 文件输出目录')
     args = parser.parse_args()
 
-    out_dir = Path(args.output_dir)
+    if args.clean_dir is None and args.noisy_dir is None and args.rir_dir is None:
+        parser.error("至少需要提供 --clean_dir、--noisy_dir、--rir_dir 中的一个")
+
+    out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. speech_sources.scp
-    n_speech = make_scp(
-        args.speech_dir, out_dir / "speech_sources.scp", args.speech_fs, prefix="sp"
-    )
+    # 按需扫描
+    clean_files = get_audio_files(args.clean_dir) if args.clean_dir else {}
+    noisy_files = get_audio_files(args.noisy_dir) if args.noisy_dir else {}
+    rir_files = get_audio_files(args.rir_dir) if args.rir_dir else {}
 
-    # 2. utt2spk (用 uid 本身作为 speaker id，若文件名含 speaker 信息可自行修改)
-    with open(out_dir / "speech_sources.scp", "r") as f_in, open(
-        out_dir / "utt2spk", "w"
-    ) as f_out:
-        for line in f_in:
-            uid = line.strip().split()[0]
-            f_out.write(f"{uid} {uid}\n")
+    # 配对检查（仅在 clean 和 noisy 都提供时）
+    if clean_files and noisy_files:
+        common_utts = sorted(set(clean_files.keys()) & set(noisy_files.keys()))
+        clean_only = sorted(set(clean_files.keys()) - set(noisy_files.keys()))
+        noisy_only = sorted(set(noisy_files.keys()) - set(clean_files.keys()))
 
-    # 3. text (无转录时填 <not-available>)
-    with open(out_dir / "speech_sources.scp", "r") as f_in, open(
-        out_dir / "text", "w"
-    ) as f_out:
-        for line in f_in:
-            uid = line.strip().split()[0]
-            f_out.write(f"{uid} <not-available>\n")
+        print("=" * 60)
+        print(f"Clean 音频总数 : {len(clean_files)}")
+        print(f"Noisy 音频总数 : {len(noisy_files)}")
+        print(f"Clean&Noisy 配对成功 : {len(common_utts)}")
+        if clean_only:
+            print(f"Clean 未配对   : {len(clean_only)} (示例: {clean_only[:5]})")
+        if noisy_only:
+            print(f"Noisy 未配对   : {len(noisy_only)} (示例: {noisy_only[:5]})")
+        print("=" * 60)
+    else:
+        common_utts = None
+        print("=" * 60)
+        if clean_files:
+            print(f"Clean 音频总数 : {len(clean_files)} (未提供 noisy，不做配对)")
+        if noisy_files:
+            print(f"Noisy 音频总数 : {len(noisy_files)} (未提供 clean，不做配对)")
+        if rir_files:
+            print(f"RIR   音频总数 : {len(rir_files)}")
+        print("=" * 60)
 
-    # 4. noise_scoures.scp
-    n_noise = make_scp(
-        args.noise_dir, out_dir / "noise_scoures.scp", args.noise_fs, prefix="noise"
-    )
+    # 1) speech.scp (clean, 3列: utt spk path)
+    if clean_files:
+        speech_scp = out_dir / 'speech.scp'
+        root = Path(args.clean_dir)
+        with open(speech_scp, 'w', encoding='utf-8') as f:
+            for utt in sorted(clean_files.keys()):
+                path = clean_files[utt]
+                spk = infer_spk(path, root)
+                f.write(f"{utt} {spk} {path}\n")
+        print(f"[Generated] {speech_scp} ({len(clean_files)} lines, 3列: utt spk path)")
 
-    # 5. wind_noise_scoures.scp (空文件，表示不使用 wind noise)
-    with open(out_dir / "wind_noise_scoures.scp", "w"):
-        pass
+    # 2) clean.scp (clean, 3列: utt spk path)
+    if clean_files:
+        clean_scp = out_dir / 'clean.scp'
+        root = Path(args.clean_dir)
+        utts_to_write = common_utts if common_utts is not None else sorted(clean_files.keys())
+        with open(clean_scp, 'w', encoding='utf-8') as f:
+            for utt in utts_to_write:
+                path = clean_files[utt]
+                spk = infer_spk(path, root)
+                f.write(f"{utt} {spk} {path}\n")
+        print(f"[Generated] {clean_scp} ({len(utts_to_write)} lines, 3列: utt spk path)")
 
-    # 6. rirs.scp
-    n_rir = make_scp(args.rir_dir, out_dir / "rirs.scp", args.rir_fs, prefix="rir")
+    # 3) mix.scp (noisy, 3列: utt spk path)
+    if noisy_files:
+        mix_scp = out_dir / 'mix.scp'
+        root = Path(args.noisy_dir)
+        utts_to_write = common_utts if common_utts is not None else sorted(noisy_files.keys())
+        with open(mix_scp, 'w', encoding='utf-8') as f:
+            for utt in utts_to_write:
+                path = noisy_files[utt]
+                spk = infer_spk(path, root)
+                f.write(f"{utt} {spk} {path}\n")
+        print(f"[Generated] {mix_scp} ({len(utts_to_write)} lines, 3列: utt spk path)")
 
-    # 7. source_length.scp (使用 soundfile 快速读取帧数)
-    import soundfile as sf
+    # 4) rir.scp (rir, 2列: utt path)
+    if rir_files:
+        rir_scp = out_dir / 'rir.scp'
+        with open(rir_scp, 'w', encoding='utf-8') as f:
+            for utt in sorted(rir_files.keys()):
+                f.write(f"{utt} {rir_files[utt]}\n")
+        print(f"[Generated] {rir_scp} ({len(rir_files)} lines, 2列: utt path)")
 
-    with open(out_dir / "speech_sources.scp", "r") as f_in, open(
-        out_dir / "source_length.scp", "w"
-    ) as f_out:
-        for line in f_in:
-            uid, fs, path = line.strip().split()
-            info = sf.info(path)
-            f_out.write(f"{uid} {info.frames}\n")
-
-    print("=" * 50)
-    print(f"Speech  files: {n_speech}")
-    print(f"Noise   files: {n_noise}")
-    print(f"RIR     files: {n_rir}")
-    print(f"Output  dir  : {out_dir.absolute()}")
-    print("=" * 50)
+    print("Done.")
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
