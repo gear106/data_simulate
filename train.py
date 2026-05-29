@@ -27,6 +27,14 @@ def main(args):
     if config.get('ckpt_path') is not None:
         ckpt = torch.load(config['ckpt_path'], map_location='cpu', weights_only=False)
         model.load_state_dict(ckpt['state_dict'], strict=False)
+
+        # 单独处理 task_embedding：预训练是3任务，微调是1任务（se），只取第0行
+        if 'dnn.task_embedding.weight' in ckpt['state_dict']:
+            pretrained_task_emb = ckpt['state_dict']['dnn.task_embedding.weight']  # [3, 512]
+            if model.dnn.task_embedding.weight.shape[0] == 1 and pretrained_task_emb.shape[0] == 3:
+                model.dnn.task_embedding.weight.data.copy_(pretrained_task_emb[0:1])
+                print("Adapted task_embedding from 3 tasks to 1 task (se)")
+
         print(f"Loaded pretrained weights from {config['ckpt_path']}")
 
     data_module = DataModule(**config['dataset_config'])
