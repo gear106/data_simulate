@@ -58,3 +58,12 @@ def estimate_snr_practical(noisy_speech_path, noise_only_path,
         'freqs': freqs,
         'sr': sr
     }
+result = estimate_snr_practical("noisy_speech.wav", "silence.wav")
+
+print(f"全局SNR: {result['snr_global_db']:.1f} dB")
+print(f"中位数分段SNR: {result['snr_median_db']:.1f} dB")
+
+# 看频域细节：哪些频段噪声大
+for f, snr in zip(result['freqs'][::10], result['snr_per_freq_db'][::10]):
+    if f <= 8000:  # 只看8kHz以内
+        print(f"{f:.0f}Hz: {snr:.1f} dB")
