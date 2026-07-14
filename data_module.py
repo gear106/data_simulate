@@ -16,11 +16,15 @@ import librosa
 import yaml
 import time
 import collections
+import logging
 
 from .simulation import simulate_data
 
 import warnings
 warnings.filterwarnings("ignore")
+
+logger = logging.getLogger(__name__)
+MAX_SAMPLE_RETRIES = 10
 
 
 class WaveInfo:
@@ -49,19 +53,15 @@ class WaveInfo:
 class TrainDataLoadIter:
     def __init__(
         self,
-        simulation_config: Union[str, Path] = None,
-        speech_scp_path: Union[str, Path, List] = None,
-        noise_scp_path: Union[str, Path, List] = None,
-        rir_scp_path: Union[str, Path, List] = None,
+        simulation_config: Union[str, Path],
+        speech_scp_path: Union[str, Path, List], 
+        noise_scp_path: Union[str, Path, List], 
+        rir_scp_path: Union[str, Path, List], 
         speech_scp_base_dir: Union[str, Path] = '',
-        mix_scp_path: Union[str, Path] = None,
-        tgt_scp_path: Union[str, Path] = None,
-        enroll_scp_path: Union[str, Path] = None,
-        mode: str = None,
-        batch_size: int = 1,
-        cut_duration: Union[float, List[float]] = 3.0,
+        batch_size: int = 1, 
+        cut_duration: Union[float, List[float]] = 3.0, 
         enroll_duration: float = 5.0,
-        num_workers: int = 1,
+        num_workers: int = 1, 
         prefetch: int = 0,
         samples_per_epoch: int = 10000,
     ):
@@ -72,48 +72,24 @@ class TrainDataLoadIter:
         self.num_workers = num_workers
         self.prefetch = prefetch
         self.samples_per_epoch = samples_per_epoch
-        self.fixed_mode = mode
 
-        self.offline_mode = mix_scp_path is not None and tgt_scp_path is not None
-        if self.offline_mode:
-            mix_list = self.load_scp_to_list(mix_scp_path, 'speech')
-            tgt_list = self.load_scp_to_list(tgt_scp_path, 'speech')
-            self.mix_dict = {info.utt: info for info in mix_list}
-            self.tgt_dict = {info.utt: info for info in tgt_list}
-            self.utt_list = sorted(set(self.mix_dict.keys()) & set(self.tgt_dict.keys()))
-            if len(self.utt_list) == 0:
-                raise ValueError("No common utt_ids found between mix_scp_path and tgt_scp_path")
+        with open(simulation_config, "r") as f:
+            self.simulation_config = yaml.safe_load(f)
+        
+        self.speech_scp_base_dir = Path(speech_scp_base_dir)
+        self.speech_list = self.load_scp_to_list(speech_scp_path, 'speech')
+        # 按说话人分类
+        self.spk2speech = collections.defaultdict(list)
+        for speech_info in self.speech_list:
+            speech_info.path = self.speech_scp_base_dir / speech_info.path
+            self.spk2speech[speech_info.spk].append(speech_info)
+        self.spk_list = list(self.spk2speech.keys())
+        for spk in self.spk_list:
+            assert len(self.spk2speech[spk]) > 1
 
-            self.enroll_dict = None
-            if enroll_scp_path is not None:
-                enroll_list = self.load_scp_to_list(enroll_scp_path, 'speech')
-                self.enroll_dict = {info.utt: info for info in enroll_list}
-                self.utt_list = sorted(set(self.utt_list) & set(self.enroll_dict.keys()))
-                if len(self.utt_list) == 0:
-                    raise ValueError("No common utt_ids found among mix_scp_path, tgt_scp_path and enroll_scp_path")
-
-            if self.fixed_mode is None:
-                self.fixed_mode = 'se'
-        else:
-            if simulation_config is None or speech_scp_path is None or noise_scp_path is None or rir_scp_path is None:
-                raise ValueError("simulation_config, speech_scp_path, noise_scp_path and rir_scp_path are required for online simulation mode")
-            with open(simulation_config, "r") as f:
-                self.simulation_config = yaml.safe_load(f)
-
-            self.speech_scp_base_dir = Path(speech_scp_base_dir)
-            self.speech_list = self.load_scp_to_list(speech_scp_path, 'speech')
-            # 按说话人分类
-            self.spk2speech = collections.defaultdict(list)
-            for speech_info in self.speech_list:
-                speech_info.path = self.speech_scp_base_dir / speech_info.path
-                self.spk2speech[speech_info.spk].append(speech_info)
-            self.spk_list = list(self.spk2speech.keys())
-            for spk in self.spk_list:
-                assert len(self.spk2speech[spk]) > 1
-
-            self.noise_list = self.load_scp_to_list(noise_scp_path, 'noise')
-            self.rir_list = self.load_scp_to_list(rir_scp_path, 'rir')
-
+        self.noise_list = self.load_scp_to_list(noise_scp_path, 'noise')
+        self.rir_list = self.load_scp_to_list(rir_scp_path, 'rir')
+        
         if dist.is_initialized():
             self.world_size = dist.get_world_size()
             self.rank = dist.get_rank()
@@ -190,100 +166,81 @@ class TrainDataLoadIter:
         thread.join(timeout)
         if thread.is_alive():
             raise TimeoutError(f"读取音频文件超时：{info.path}")
-
+        
         result = result_queue.get()
         if isinstance(result, Exception):
             raise Exception('load error')
         return result
-
+    
     def process_one_sample(self, fs, cut_duration, mode):
-        if self.offline_mode:
-            utt = random.choice(self.utt_list)
-            mix, _ = self.load_wav(self.mix_dict[utt], fs)
-            speech, _ = self.load_wav(self.tgt_dict[utt], fs)
-            enroll = None
-            if self.enroll_dict is not None:
-                enroll, _ = self.load_wav(self.enroll_dict[utt], fs)
+        try:
+            spk1, spk2 = random.sample(self.spk_list, 2)
+
+            speech_info, enroll_info = random.sample(self.spk2speech[spk1], 2)
+            interf_info = random.choice(self.spk2speech[spk2])
+            if mode == 'tse' or mode == 'rtse':  # 启用TSE/rTSE模式
+                try:
+                    speech, _ = self.load_wav_with_timeout(speech_info, fs, timeout=2.0)
+                    enroll, _ = self.load_wav_with_timeout(enroll_info, fs, timeout=2.0)
+                    interf, _ = self.load_wav_with_timeout(interf_info, fs, timeout=2.0)
+                except Exception as e:
+                    logger.warning(f"load_wav failed for tse/rtse: {e}")
+                    return None
+            elif mode == 'se' and random.random() < self.simulation_config['se_interference']['prob']:  # SE模式，启用干扰说话人
+                try:
+                    speech, _ = self.load_wav_with_timeout(speech_info, fs, timeout=2.0)
+                    enroll = None
+                    interf, _ = self.load_wav_with_timeout(interf_info, fs, timeout=2.0)
+                except Exception as e:
+                    logger.warning(f"load_wav failed for se with interference: {e}")
+                    return None
+            else:  # SE模式，不启用干扰说话人
+                try:
+                    speech, _ = self.load_wav_with_timeout(speech_info, fs, timeout=2.0)
+                    enroll = None
+                    interf = None
+                except Exception as e:
+                    logger.warning(f"load_wav failed for se: {e}")
+                    return None
+
+            noise_info = random.choice(self.noise_list)
+            noise, _ = self.load_wav(noise_info, fs)
+
+            rir_info = random.choice(self.rir_list)
+            rir, _ = self.load_wav(rir_info, fs)
+
+            mix, speech, interf = simulate_data(
+                mode=mode,
+                speech=speech,
+                interf=interf,
+                noise=noise,
+                rir=rir,
+                fs=fs,
+                config=self.simulation_config,
+            )
 
             if cut_duration is not None:
                 length = int(cut_duration * fs)
                 mix, offset = self.pad_or_cut_wav(mix, length, offset=None)
                 speech, _ = self.pad_or_cut_wav(speech, length, offset)
+                if interf is not None:
+                    interf, _ = self.pad_or_cut_wav(interf, length, offset)
             else:
                 length = speech.shape[-1]
 
-            mix, speech = self.normalize_src_tgt(mix, speech)
+            if interf is None:
+                mix, speech = self.normalize_src_tgt(mix, speech)
+            else:
+                mix, speech, interf = self.normalize_mix_speech_inferf(mix, speech, interf)
 
             if enroll is not None:
                 enroll, _ = self.pad_or_cut_wav(enroll, int(self.enroll_duration * fs), offset=None)
                 enroll = enroll / (np.max(np.abs(enroll)) + 1e-5) * 0.99
 
-            return enroll, mix, speech, None, fs, length, utt
-
-        spk1, spk2 = random.sample(self.spk_list, 2)
-
-        speech_info, enroll_info = random.sample(self.spk2speech[spk1], 2)
-        interf_info = random.choice(self.spk2speech[spk2])
-        if mode == 'tse' or mode == 'rtse':  # 启用TSE/rTSE模式
-            try:
-                speech, _ = self.load_wav_with_timeout(speech_info, fs, timeout=2.0)
-                enroll, _ = self.load_wav_with_timeout(enroll_info, fs, timeout=2.0)
-                interf, _ = self.load_wav_with_timeout(interf_info, fs, timeout=2.0)
-            except Exception as e:
-                print(e)
-                return self.process_one_sample(fs, cut_duration, mode)
-        elif mode == 'se' and random.random() < self.simulation_config['se_interference']['prob']:  # SE模式，启用干扰说话人
-            try:
-                speech, _ = self.load_wav_with_timeout(speech_info, fs, timeout=2.0)
-                enroll = None
-                interf, _ = self.load_wav_with_timeout(interf_info, fs, timeout=2.0)
-            except Exception as e:
-                print(e)
-                return self.process_one_sample(fs, cut_duration, mode)
-        else:  # SE模式，不启用干扰说话人
-            try:
-                speech, _ = self.load_wav_with_timeout(speech_info, fs, timeout=2.0)
-                enroll = None
-                interf = None
-            except Exception as e:
-                print(e)
-                return self.process_one_sample(fs, cut_duration, mode)
-
-        noise_info = random.choice(self.noise_list)
-        noise, _ = self.load_wav(noise_info, fs)
-
-        rir_info = random.choice(self.rir_list)
-        rir, _ = self.load_wav(rir_info, fs)
-
-        mix, speech, interf = simulate_data(
-            mode=mode,
-            speech=speech,
-            interf=interf,
-            noise=noise,
-            rir=rir,
-            fs=fs,
-            config=self.simulation_config,
-        )
-
-        if cut_duration is not None:
-            length = int(cut_duration * fs)
-            mix, offset = self.pad_or_cut_wav(mix, length, offset=None)
-            speech, _ = self.pad_or_cut_wav(speech, length, offset)
-            if interf is not None:
-                interf, _ = self.pad_or_cut_wav(interf, length, offset)
-        else:
-            length = speech.shape[-1]
-
-        if interf is None:
-            mix, speech = self.normalize_src_tgt(mix, speech)
-        else:
-            mix, speech, interf = self.normalize_mix_speech_inferf(mix, speech, interf)
-
-        if enroll is not None:
-            enroll, _ = self.pad_or_cut_wav(enroll, int(self.enroll_duration * fs), offset=None)
-            enroll = enroll / (np.max(np.abs(enroll)) + 1e-5) * 0.99
-
-        return enroll, mix, speech, interf, fs, length, speech_info.utt
+            return enroll, mix, speech, interf, fs, length, speech_info.utt
+        except Exception as e:
+            logger.warning(f"process_one_sample failed: {e}")
+            return None
 
 
     def data_iter_fn(self, q, event):
@@ -291,7 +248,26 @@ class TrainDataLoadIter:
         for _ in range(len(self)): # for each batch
             fs = 16000 # sample a fs
             cut_duration = self.cut_duration if not isinstance(self.cut_duration, list) else random.uniform(*self.cut_duration)  # sample cut_duration
-            mode = self.fixed_mode if self.fixed_mode is not None else random.choice(['se', 'tse', 'rtse'])
+            mode = random.choice(['se', 'tse', 'rtse'])
+
+            samples = []
+            total_attempts = 0
+            max_attempts = self.batch_size * MAX_SAMPLE_RETRIES
+            while len(samples) < self.batch_size and total_attempts < max_attempts:
+                remaining = self.batch_size - len(samples)
+                futures = [executor.submit(self.process_one_sample, fs, cut_duration, mode) for _ in range(remaining)]
+                for future in futures:
+                    total_attempts += 1
+                    result = future.result()
+                    if result is not None:
+                        samples.append(result)
+                    if len(samples) >= self.batch_size:
+                        break
+
+            if len(samples) < self.batch_size:
+                logger.error(f"could only collect {len(samples)}/{self.batch_size} valid samples, skipping batch")
+                continue
+
             batch_enroll = []
             batch_mix = []
             batch_speech = []
@@ -299,7 +275,7 @@ class TrainDataLoadIter:
             batch_fs = []
             lengths = []
             names = []
-            for result in executor.map(self.process_one_sample, [fs] * self.batch_size, [cut_duration] * self.batch_size, [mode] * self.batch_size):
+            for result in samples:
                 enroll, mix, speech, interf, fs, length, name = result
                 batch_enroll.append(enroll)
                 batch_mix.append(mix)
@@ -316,13 +292,15 @@ class TrainDataLoadIter:
             lengths = torch.LongTensor(lengths)
             q.put((mode, batch_enroll, batch_mix, batch_speech, batch_interf, batch_fs, lengths, names))
         event.set()
-    
+
     def __iter__(self):
         q = queue.Queue(maxsize=self.prefetch + 1)
         event = threading.Event()
         worker = threading.Thread(target=self.data_iter_fn, args=(q, event))
         worker.start()
         while not event.is_set() or not q.empty():
+            if not worker.is_alive() and q.empty():
+                raise RuntimeError("Data loader worker thread died unexpectedly. Check logs for errors.")
             try:
                 yield q.get(timeout=1.0)
             except queue.Empty:
