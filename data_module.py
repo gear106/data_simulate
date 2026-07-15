@@ -1,408 +1,412 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, Union
+from typing import Optional, Tuple, List, Union
 
-from .llm import CustomLlamaModel
+from transformers import LlamaModel, LlamaConfig
+from transformers.cache_utils import Cache, DynamicCache
+from transformers.modeling_outputs import BaseModelOutputWithPast
+
+from .conformer import ConformerEncoder
 
 
-class LLM_SFT_HCodec(CustomLlamaModel):
-    """SFT LLM for HCodec tokens with interleaved delay pattern.
-
-    Following the UniTok paper:
-      - HCodec produces 4-layer acoustic and semantic tokens (B, 4, T).
-      - Acoustic and semantic frames are interleaved into a single 50 Hz Ec
-        sequence: [codec_sos, A0, S0, A1, S1, ..., codec_eos].
-      - A single delay pattern is applied to Ec, with special pad tokens
-        occupying empty positions.
-      - The LM backbone uses 4 independent embedding layers and 4 independent
-        output heads, one per RVQ layer.
-      - Embeddings for each layer are selected by position.
-    """
-
-    NUM_QUANTIZERS = 4
-    NUM_SPECIAL_TOKENS = 3  # pad, codec_sos, codec_eos
-
+class CustomLlamaModel(nn.Module):
     def __init__(
         self,
-        num_tasks: int = 1,
-        task_map: dict = {
-            'se': 0,
+        cond_dim: int = 80,
+        global_size: int = 4096,
+        semantic_size: int = 8192,
+        hidden_size: int = 256,
+        num_layers: int = 2,
+        num_attention_heads: int = 8,
+        dropout_p: float = 0.1,
+        max_position_embeddings = 4096,
+        label_smoothing: float = 0.1,
+        conformer_params: dict = {
+            "num_layers": 2,
+            "dim": 256,
+            "heads": 8, 
+            "dim_head": 32,
+            "depthwise_conv_kernel_size": 31,
+            'ff_mult': 4,
+            'dropout': 0.1,
+            'qk_norm': None,
+            'pe_attn_head': None,
         },
-        feats_dim: int = 768,
-        llm_base_config: dict = {},
     ):
-        # HCodec uses a single shared codebook size for all RVQ layers.
-        self.codebook_size = llm_base_config.get('codebook_size', 1024)
-        # Dummy values to satisfy parent __init__ signature; we override them.
-        hcodec_config = llm_base_config.copy()
-        hcodec_config['global_size'] = self.codebook_size
-        hcodec_config['semantic_size'] = self.codebook_size
-        super().__init__(**hcodec_config)
+        super().__init__()
+        
+        self.global_sos_token_id = 0
+        self.semantic_sos_token_id = 1
+        self.semantic_eos_token_id = 2
+        self.vocab_size = 3 + global_size + semantic_size
+        self.global_offset = 3
+        self.semantic_offset = 3 + global_size
+        self.global_size = global_size
+        self.semantic_size = semantic_size
 
-        # Override vocab size and special token ids.
-        self.vocab_size = self.codebook_size + self.NUM_SPECIAL_TOKENS
-        self.config.vocab_size = self.vocab_size
-        self.pad_token_id = self.codebook_size
-        self.codec_sos_token_id = self.codebook_size + 1
-        self.codec_eos_token_id = self.codebook_size + 2
+        # 指示mixture开始的embedding，不需要id，因为模型不需要输出它
+        self.mix_sos_embedding = nn.Embedding(1, hidden_size)
 
-        # 4 independent embedding layers, one per RVQ layer.
-        del self.codec_embedding
-        self.codec_embeddings = nn.ModuleList([
-            nn.Embedding(self.vocab_size, self.config.hidden_size)
-            for _ in range(self.NUM_QUANTIZERS)
-        ])
+        # condition encoder
+        self.cond_input_layer = nn.Linear(cond_dim, conformer_params["dim"])
+        self.cond_encoder = ConformerEncoder(**conformer_params)
+        self.cond_output_layer = nn.Linear(conformer_params["dim"], hidden_size)
 
-        # 4 independent output heads, one per RVQ layer.
-        del self.output_head
-        self.output_heads = nn.ModuleList([
-            nn.Linear(self.config.hidden_size, self.vocab_size, bias=False)
-            for _ in range(self.NUM_QUANTIZERS)
-        ])
-
-        self.task_map = task_map
-
-        # Condition / task embeddings.
-        self.task_embedding = nn.Embedding(num_tasks, self.config.hidden_size)
-        self.enroll_sos_embedding = nn.Embedding(1, self.config.hidden_size)
-        self.adapter = nn.Linear(feats_dim, self.config.hidden_size)
-
-    # ------------------------------------------------------------------
-    # Delay pattern helpers
-    # ------------------------------------------------------------------
-    def build_delay_pattern(
-        self,
-        codes: Union[torch.IntTensor, torch.LongTensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Convert (B, 4, T) RVQ codes into a flattened delay pattern.
-
-        Returns:
-            delayed_ids: (B, (T + 3) * 4) flattened token ids with pad tokens.
-            mask:        (B, (T + 3) * 4) bool mask, True for non-pad positions.
-        """
-        b, n_q, t = codes.shape
-        assert n_q == self.NUM_QUANTIZERS
-        delayed = torch.full(
-            (b, n_q, t + n_q - 1),
-            self.pad_token_id,
-            dtype=codes.dtype,
-            device=codes.device,
+        # 自定义输入embedding层
+        self.codec_embedding = nn.Embedding(
+            self.vocab_size,
+            hidden_size,
         )
-        for q in range(n_q):
-            delayed[:, q, q:q + t] = codes[:, q, :]
-        # Interleave across time steps: (B, T+3, 4) -> (B, (T+3)*4)
-        delayed_flat = delayed.transpose(1, 2).reshape(b, -1)
-        mask = delayed_flat != self.pad_token_id
-        return delayed_flat, mask
-
-    def recover_codes_from_delay(
-        self,
-        delayed_ids: Union[torch.IntTensor, torch.LongTensor],
-        t: int,
-    ) -> torch.Tensor:
-        """Recover (B, 4, T) RVQ codes from a flattened delay pattern."""
-        b = delayed_ids.size(0)
-        n_q = self.NUM_QUANTIZERS
-        delayed_2d = delayed_ids.reshape(b, t + n_q - 1, n_q)
-        codes = torch.zeros(b, n_q, t, dtype=delayed_ids.dtype, device=delayed_ids.device)
-        for q in range(n_q):
-            codes[:, q, :] = delayed_2d[:, q:q + t, q]
-        return codes
-
-    def build_interleaved_ec(
-        self,
-        acoustic_ids: Union[torch.IntTensor, torch.LongTensor],
-        semantic_ids: Union[torch.IntTensor, torch.LongTensor],
-    ) -> torch.Tensor:
-        """Build interleaved 50 Hz Ec from 25 Hz acoustic/semantic tokens.
-
-        Ec = [A0, S0, A1, S1, A2, S2, ...]
-        """
-        b, n_q, t_a = acoustic_ids.shape
-        _, _, t_s = semantic_ids.shape
-        assert n_q == self.NUM_QUANTIZERS
-        if t_a != t_s:
-            raise ValueError(
-                f"acoustic and semantic time steps must match: got {t_a} and {t_s}"
-            )
-        t = t_a + t_s  # interleaved acoustic/semantic frames
-        Ec = torch.empty(
-            (b, t, n_q),
-            dtype=acoustic_ids.dtype,
-            device=acoustic_ids.device,
+        
+        # 获取Llama的transformer层
+        config = LlamaConfig(
+            vocab_size=self.vocab_size,
+            hidden_size=hidden_size,
+            num_hidden_layers=num_layers,
+            num_attention_heads=num_attention_heads,
+            intermediate_size=hidden_size * 4,
+            dropout_rate=dropout_p,
+            attention_dropout=dropout_p,
+            max_position_embeddings=max_position_embeddings,  # rope的最长序列长度
         )
-        # Even positions are acoustic; odd positions are semantic.
-        Ec[:, ::2, :] = acoustic_ids.transpose(1, 2)
-        Ec[:, 1::2, :] = semantic_ids.transpose(1, 2)
-        return Ec
+        self.config = config
+        llama_model = LlamaModel(config)
+        self.layers = llama_model.layers
+        self.rotary_emb = llama_model.rotary_emb
+        self.norm = llama_model.norm
 
-    def split_interleaved_ec(
-        self,
-        Ec: Union[torch.IntTensor, torch.LongTensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Split interleaved Ec back into acoustic and semantic codes.
+        self._update_causal_mask = llama_model._update_causal_mask
+        
+        # 自定义输出层
+        self.output_head = nn.Linear(hidden_size, self.vocab_size, bias=False)  # [hidden_size, vocab_size]
 
-        Returns:
-            acoustic_ids: (B, 4, T_a)
-            semantic_ids: (B, 4, T_s)
-        """
-        t = Ec.size(1)
-        if t % 2 != 0:
-            raise ValueError(f"Ec time steps {t} must be even")
-        t_a = t // 2
-        acoustic_ids = Ec[:, ::2, :].transpose(1, 2)
-        semantic_ids = Ec[:, 1::2, :].transpose(1, 2)
-        return acoustic_ids, semantic_ids
+        self.label_smoothing = label_smoothing
 
-    def _layer_ids_for_length(self, length: int, device: torch.device) -> torch.Tensor:
-        """Return the RVQ layer index for each position in a length-L sequence."""
-        return torch.arange(length, device=device) % self.NUM_QUANTIZERS
 
-    def _layer_ids_for_positions(self, start_pos: int, length: int, device: torch.device) -> torch.Tensor:
-        """Return the RVQ layer index for positions [start_pos, start_pos + length)."""
-        return (torch.arange(start_pos, start_pos + length, device=device) % self.NUM_QUANTIZERS)
-
-    def embed_with_delay(self, input_ids: torch.Tensor, start_pos: int = 0) -> torch.Tensor:
-        """Select embeddings from the 4 layer-specific lookup tables by position."""
-        b, length = input_ids.shape
-        layer_ids = self._layer_ids_for_positions(start_pos, length, input_ids.device)
-        embeds = torch.zeros(b, length, self.config.hidden_size, device=input_ids.device)
-        for q in range(self.NUM_QUANTIZERS):
-            mask = layer_ids == q
-            if mask.any():
-                embeds[:, mask, :] = self.codec_embeddings[q](input_ids[:, mask])
-        return embeds
-
-    def output_with_delay(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Apply the 4 layer-specific output heads by position."""
-        b, length, _ = hidden_states.shape
-        layer_ids = self._layer_ids_for_length(length, hidden_states.device)
-        logits = torch.zeros(b, length, self.vocab_size, device=hidden_states.device)
-        for q in range(self.NUM_QUANTIZERS):
-            mask = layer_ids == q
-            if mask.any():
-                logits[:, mask, :] = self.output_heads[q](hidden_states[:, mask, :])
-        return logits
-
-    # ------------------------------------------------------------------
-    # Loss
-    # ------------------------------------------------------------------
-    def loss_function(self, logits, target, mask):
+    def loss_function(self, logits, target):
         logits = logits.float()
-        b, length, size = logits.shape
-        logits_flat = logits.reshape(-1, size)
-        target_flat = target.reshape(-1)
-        mask_flat = mask.reshape(-1)
-
-        if not mask_flat.any():
-            return logits.sum() * 0.0
-
         confidence = 1.0 - self.label_smoothing
-        with torch.no_grad():
-            true_dist = torch.full_like(logits_flat, self.label_smoothing / (size - 1))
-            true_dist.scatter_(1, target_flat.unsqueeze(1), confidence)
+        size = logits.size(-1)
+        logits = logits.reshape(-1, size)
+        target = target.reshape(-1)
 
+        with torch.no_grad():
+            true_dist = logits.clone()
+            true_dist.fill_(self.label_smoothing / (size - 1))
+            true_dist.scatter_(1, target.unsqueeze(1), confidence)
+            
         loss = F.kl_div(
-            F.log_softmax(logits_flat[mask_flat], dim=-1),
-            true_dist[mask_flat],
+            F.log_softmax(logits, dim=-1),
+            true_dist,
             reduction='batchmean',
         )
         return loss
 
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
+
     def forward(
         self,
-        task_name: str,
-        enroll_mel: torch.Tensor,
-        enroll_feats: torch.Tensor,
-        mix_mel: torch.Tensor,
-        mix_feats: torch.Tensor,
-        acoustic_ids: Union[torch.IntTensor, torch.LongTensor],  # (B, 4, T_a)
-        semantic_ids: Union[torch.IntTensor, torch.LongTensor],  # (B, 4, T_s)
+        global_ids: Union[torch.IntTensor, torch.LongTensor],  # (B, 32)
+        semantic_ids: Union[torch.IntTensor, torch.LongTensor],  # (B, T)
+        cond: Union[torch.FloatTensor, type(None)] = None, # (B, T, n_mels)
     ):
-        # Interleave acoustic/semantic frames into a single 50 Hz Ec, apply the
-        # delay pattern, then prepend a codec_sos frame and append a codec_eos
-        # frame (one per RVQ layer), matching MusicGen's pattern layout.
-        Ec = self.build_interleaved_ec(acoustic_ids, semantic_ids)
-        delayed_ids, _ = self.build_delay_pattern(Ec.transpose(1, 2))
+        # (B, 32)
+        global_ids = global_ids.long() + self.global_offset
+        semantic_ids = semantic_ids.long() + self.semantic_offset
 
-        b = delayed_ids.size(0)
-        device = delayed_ids.device
-        n_q = self.NUM_QUANTIZERS
-        t_ec = Ec.size(1)
-        seq_steps = t_ec + n_q - 1  # steps from the core delay pattern
+        global_sos_token_ids = torch.full((global_ids.size(0), 1), self.global_sos_token_id, dtype=global_ids.dtype, device=global_ids.device)
+        semantic_sos_token_ids = torch.full((semantic_ids.size(0), 1), self.semantic_sos_token_id, dtype=semantic_ids.dtype, device=semantic_ids.device)
+        semantic_eos_token_ids = torch.full((semantic_ids.size(0), 1), self.semantic_eos_token_id, dtype=semantic_ids.dtype, device=semantic_ids.device)
 
-        # Reshape to (B, seq_steps, n_q) to add sos/eos frames.
-        delayed_2d = delayed_ids.reshape(b, seq_steps, n_q)
-        delayed_with_se = torch.full(
-            (b, seq_steps + 2, n_q),
-            self.pad_token_id,
-            dtype=delayed_ids.dtype,
-            device=device,
-        )
-        delayed_with_se[:, 0, :] = self.codec_sos_token_id
-        delayed_with_se[:, 1:-1, :] = delayed_2d
-        delayed_with_se[:, -1, :] = self.codec_eos_token_id
-        delayed_ids = delayed_with_se.reshape(b, -1)
-        mask = delayed_ids != self.pad_token_id
+        input_ids = torch.cat([global_sos_token_ids, global_ids, semantic_sos_token_ids, semantic_ids], dim=1)  # (B, 1+32+1+T)
+        target_ids = torch.cat([global_ids, semantic_sos_token_ids, semantic_ids, semantic_eos_token_ids], dim=1)  # (B, 32+1+T+1)
 
-        # Causal LM: input is delayed sequence without last token; target is
-        # delayed sequence shifted by one position.
-        input_ids = delayed_ids[:, :-1]
-        target_ids = delayed_ids[:, 1:]
-        loss_mask = mask[:, 1:]
+        # 预训练时防止对semantic_eos_token_ids进行建模，因为可能导致模型倾向于输出终止token
+        # 并且训练数据可能是从音频中间截断，此时也不应该终止
+        input_ids = input_ids[:, :-1]
+        target_ids = target_ids[:, :-1]
 
-        # Condition embeddings.
-        task_embeds = self.task_embedding(
-            torch.full((mix_mel.size(0), 1), self.task_map[task_name], dtype=torch.int64, device=device)
-        )
-        mixture = self.adapter(mix_feats)
-        mix_sos_embeds = self.mix_sos_embedding(
-            torch.full((mixture.size(0), 1), 0, dtype=torch.int64, device=device)
-        )
-
-        if enroll_mel is not None:
-            enroll = self.adapter(enroll_feats)
-            enroll_sos_embeds = self.enroll_sos_embedding(
-                torch.full((enroll.size(0), 1), 0, dtype=torch.int64, device=device)
-            )
-            cond_embeds = torch.cat(
-                [task_embeds, enroll_sos_embeds, enroll, mix_sos_embeds, mixture], dim=1
-            )
+        if cond is not None:
+            cond = self.cond_input_layer(cond)  # (B, T, hidden_size)
+            cond = self.cond_encoder(cond)  # (B, T, hidden_size)
+            cond = self.cond_output_layer(cond)  # (B, T, hidden_size)
+            mix_sos_embeds = self.mix_sos_embedding(torch.full((cond.size(0), 1), 0, dtype=torch.int64, device=cond.device))  # (B, 1, hidden_size)
+            inputs_embeds = torch.cat([mix_sos_embeds, cond, self.codec_embedding(input_ids)], dim=1)
         else:
-            cond_embeds = torch.cat([task_embeds, mix_sos_embeds, mixture], dim=1)
-
-        inputs_embeds = torch.cat([cond_embeds, self.embed_with_delay(input_ids)], dim=1)
-
+            inputs_embeds = self.codec_embedding(input_ids)  # (B, 1+32+1+T-1, hidden_size)
+        
+        # 经过llm
         outputs = self.llm_forward(inputs_embeds)
-        hidden_states = outputs.last_hidden_state[:, -target_ids.size(-1):, :]
+        hidden_states = outputs.last_hidden_state[:, -target_ids.size(-1):, :]  # 去掉可能的条件部分
+        
+        logits = self.output_head(hidden_states)  # (B, 1+32+1+T-1, vocab_size)
 
-        logits = self.output_with_delay(hidden_states)
-
-        loss = self.loss_function(logits, target_ids, loss_mask)
-        acc = ((logits.argmax(-1) == target_ids) & loss_mask).float().mean()
+        loss = self.loss_function(logits, target_ids)
+        acc = (logits.argmax(-1) == target_ids).float().mean()
 
         return loss, acc
 
-    # ------------------------------------------------------------------
-    # Generation
-    # ------------------------------------------------------------------
+
+    def llm_forward(
+        self,
+        inputs_embeds: Optional[torch.FloatTensor],
+        attention_mask: Optional[torch.Tensor] = None,  # SDPA 不需要指定attention_mask，默认为causal
+        past_key_values: Optional[Cache] = None,
+        use_cache: Optional[bool] = False,
+        output_attentions: Optional[bool] = False,
+        output_hidden_states: Optional[bool] = False,
+        position_ids: Optional[torch.LongTensor] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **flash_attn_kwargs,
+    ) -> BaseModelOutputWithPast:
+        """
+        模型前向传播
+        
+        Returns:
+            如果use_cache=False: logits [batch_size, seq_len, vocab_size]
+            如果use_cache=True: (logits, past_key_values)
+        """
+        
+        if use_cache and past_key_values is None:
+            past_key_values = DynamicCache()
+        
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position = torch.arange(
+                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+            )
+        
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
+
+        causal_mask = self._update_causal_mask(
+            attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
+        )
+
+        hidden_states = inputs_embeds
+
+        # create position embeddings to be shared across the decoder layers
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+        # decoder layers
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attns = () if output_attentions else None
+
+        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+
+            layer_outputs = decoder_layer(
+                hidden_states,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_values,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+                **flash_attn_kwargs,
+            )
+
+            hidden_states = layer_outputs[0]
+            # On Windows (WDDM), a single long-running CUDA kernel can trigger the
+            # GPU timeout detection and recovery (TDR). Periodically synchronizing
+            # breaks the kernel stream into smaller chunks, avoiding the hang.
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+
+            if output_attentions:
+                all_self_attns += (layer_outputs[1],)
+
+        hidden_states = self.norm(hidden_states)
+
+        # add hidden states from the last decoder layer
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=past_key_values if use_cache else None,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attns,
+        )
+
+    # 此函数仅用作测试QK_Cache
+    def test_generate(
+        self,
+        inputs_embeds: Optional[torch.FloatTensor],
+        top_k: int = 50,
+        top_p: float = 0.95,
+        temperature: float = 0.8,
+    ):
+        past_key_values = None
+        last_hidden_states = []
+
+        for ii in range(inputs_embeds.size(1)):
+            current_output = self.llm_forward(
+                inputs_embeds[:, ii:ii+1],
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            last_hidden_states.append(current_output.last_hidden_state)
+            past_key_values = current_output.past_key_values
+        
+        last_hidden_states = torch.cat(last_hidden_states, dim=1)
+        return last_hidden_states
+    
+
+    def sample_logits(
+        self,
+        logits: torch.FloatTensor,  # [batch_size, vocab_size]
+        temperature: float = 0.8,
+        top_k: int = 50,
+        top_p: float = 0.95,
+        do_sample: bool = True,
+    ):  
+        # Top-K 过滤
+        if top_k > 0:
+            indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+            logits[indices_to_remove] = float('-inf')
+        
+        # Top-p (nucleus) 采样
+        if top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True)  # 从大到小，默认最后一维
+            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+            
+            sorted_indices_to_remove = cumulative_probs > top_p
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+            sorted_indices_to_remove[..., 0] = 0  # 使概率刚好超过top_p一个
+            
+            indices_to_remove = sorted_indices_to_remove.scatter(-1, sorted_indices, sorted_indices_to_remove)
+            logits[indices_to_remove] = float('-inf')
+        
+        assert 0 < temperature <= 1.0
+        logits = logits / temperature
+        
+        # 采样或贪婪搜索
+        if do_sample:
+            probs = F.softmax(logits, dim=-1)
+            next_tokens = torch.multinomial(probs, num_samples=1)  # [batch_size, 1]
+        else:
+            next_tokens = torch.argmax(logits, dim=-1, keepdim=True)  # [batch_size, 1]
+        
+        return next_tokens
+    
+
     def generate(
         self,
-        task_name: str,
-        enroll_mel: torch.Tensor,
-        enroll_feats: torch.Tensor,
-        mix_mel: torch.Tensor,
-        mix_feats: torch.Tensor,
-        acoustic_t: int = None,
-        semantic_t: int = None,
+        cond: Union[torch.FloatTensor, type(None)] = None,
+        global_length: int = 32,
+        semantic_length: int = 150,
         temperature: float = 0.8,
         top_k: int = 50,
         top_p: float = 0.95,
         do_sample: bool = True,
     ):
-        """Generate flattened delay-pattern tokens for the interleaved Ec sequence.
-
-        Defaults assume mix_mel is 50 Hz and both HCodec acoustic and semantic
-        tokens are 25 Hz. Pass ``acoustic_t`` / ``semantic_t`` to override.
-        """
-        if acoustic_t is None:
-            acoustic_t = mix_mel.size(1) // 2
-        if semantic_t is None:
-            semantic_t = mix_mel.size(1) // 2
-
-        n_q = self.NUM_QUANTIZERS
-        t_ec = acoustic_t + semantic_t  # interleaved acoustic/semantic frames
-        total_len = (t_ec + n_q + 1) * n_q  # + sos frame + eos frame
-
-        device = mix_mel.device
-        b = mix_mel.size(0)
-
-        # Condition embeddings.
-        task_embeds = self.task_embedding(
-            torch.full((b, 1), self.task_map[task_name], dtype=torch.int64, device=device)
-        )
-        mixture = self.adapter(mix_feats)
-        mix_sos_embeds = self.mix_sos_embedding(
-            torch.full((b, 1), 0, dtype=torch.int64, device=device)
-        )
-
-        if enroll_mel is not None:
-            enroll = self.adapter(enroll_feats)
-            enroll_sos_embeds = self.enroll_sos_embedding(
-                torch.full((b, 1), 0, dtype=torch.int64, device=device)
-            )
-            cond_embeds = torch.cat(
-                [task_embeds, enroll_sos_embeds, enroll, mix_sos_embeds, mixture], dim=1
-            )
+        if cond is None:
+            past_key_values = None
         else:
-            cond_embeds = torch.cat([task_embeds, mix_sos_embeds, mixture], dim=1)
-
-        current_output = self.llm_forward(cond_embeds, past_key_values=None, use_cache=True)
-        past_key_values = current_output.past_key_values
-
-        # Relative position within the generated token sequence. The first
-        # generated token (codec_sos) is at relative position 0; subsequent
-        # tokens increment by 1. Embedding/output head are selected by this
-        # relative position so that inference matches training.
-        rel_pos = 0
-
-        # Helper to run one autoregressive step at a known relative position.
-        def step(input_ids: torch.Tensor, pos: int) -> torch.Tensor:
-            nonlocal past_key_values
-            inputs_embeds = self.embed_with_delay(input_ids, start_pos=pos)
+            cond = self.cond_input_layer(cond)  # (B, T, hidden_size)
+            cond = self.cond_encoder(cond)  # (B, T, hidden_size)
+            cond = self.cond_output_layer(cond)  # (B, T, hidden_size)
+            mix_sos_embeds = self.mix_sos_embedding(torch.full((cond.size(0), 1), 0, dtype=torch.int64, device=cond.device))  # (B, 1, hidden_size)
+            inputs_embeds = torch.cat([mix_sos_embeds, cond], dim=1)
+            current_output = self.llm_forward(
+                inputs_embeds,
+                past_key_values=None,
+                use_cache=True,
+            )
+            past_key_values = current_output.past_key_values
+        
+        input_ids = torch.full((1, 1), self.global_sos_token_id, dtype=torch.long, device=next(self.parameters()).device)
+        output_ids = []
+        for _ in range(global_length):
+            inputs_embeds = self.codec_embedding(input_ids)
             current_output = self.llm_forward(
                 inputs_embeds,
                 past_key_values=past_key_values,
                 use_cache=True,
             )
             past_key_values = current_output.past_key_values
-            hidden = current_output.last_hidden_state[:, -1:, :]  # (B, 1, H)
-            q = int(pos % n_q)
-            logits = self.output_heads[q](hidden)  # (B, 1, V)
-            next_token = self.sample_logits(
-                logits.squeeze(1),
+            hidden_states = current_output.last_hidden_state  # [batch_size, 1, hidden_size]
+            next_token_logits = self.output_head(hidden_states)  # [batch_size, 1, vocab_size]
+            
+            # 将非global_token的地方设置为 -float('inf')
+            mask = torch.zeros_like(next_token_logits, dtype=torch.bool)
+            mask[..., self.global_offset: self.global_offset+self.global_size] = True
+            next_token_logits[~mask] = float('-inf')
+
+            next_token_id = self.sample_logits(
+                next_token_logits.squeeze(1),
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
                 do_sample=do_sample,
+            )  # [batch_size, 1]
+            output_ids.append(next_token_id)
+            input_ids = next_token_id
+        global_ids = torch.cat(output_ids, dim=-1) - self.global_offset  #  [batch_size, global_length]
+
+        input_ids = torch.full((1, 1), self.semantic_sos_token_id, dtype=torch.long, device=next(self.parameters()).device)
+        output_ids = []
+        for _ in range(semantic_length):
+            inputs_embeds = self.codec_embedding(input_ids)
+            current_output = self.llm_forward(
+                inputs_embeds,
+                past_key_values=past_key_values,
+                use_cache=True,
             )
-            return next_token
+            past_key_values = current_output.past_key_values
+            hidden_states = current_output.last_hidden_state  # [batch_size, 1, hidden_size]
+            next_token_logits = self.output_head(hidden_states)  # [batch_size, 1, vocab_size]
 
-        # The delayed sequence starts with a full codec_sos frame and ends with a
-        # full codec_eos frame; both are emitted deterministically.
-        input_ids = torch.full(
-            (b, 1), self.codec_sos_token_id, dtype=torch.long, device=device
-        )
-        generated = []
-        for pos in range(total_len - 1):
-            next_token = step(input_ids, rel_pos)
-            # Force the first full frame (positions 1..n_q-1) to codec_sos.
-            if pos < n_q - 1:
-                next_token = torch.full(
-                    (b, 1), self.codec_sos_token_id, dtype=torch.long, device=device
-                )
-            # Force the last full frame (positions total_len-n_q..total_len-1) to codec_eos.
-            if pos >= total_len - n_q - 1:
-                next_token = torch.full(
-                    (b, 1), self.codec_eos_token_id, dtype=torch.long, device=device
-                )
-            generated.append(next_token)
-            input_ids = next_token
-            rel_pos += 1
-        delayed_ids = torch.cat(
-            [torch.full((b, 1), self.codec_sos_token_id, dtype=torch.long, device=device)]
-            + generated,
-            dim=-1,
-        )
+            # 将非semantic_token的地方设置为 -float('inf')
+            mask = torch.zeros_like(next_token_logits, dtype=torch.bool)
+            mask[..., self.semantic_offset: self.semantic_offset+self.semantic_size] = True
+            next_token_logits[~mask] = float('-inf')
+            
+            next_token_id = self.sample_logits(
+                next_token_logits.squeeze(1),
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                do_sample=do_sample,
+            )  # [batch_size, 1]
+            output_ids.append(next_token_id)
+            input_ids = next_token_id
+        semantic_ids = torch.cat(output_ids, dim=-1) - self.semantic_offset
+        
+        return global_ids, semantic_ids
 
-        # Recover interleaved Ec: strip sos/eos frames, undo delay pattern, split.
-        delayed_2d = delayed_ids.reshape(b, t_ec + n_q + 1, n_q)
-        delayed_core = delayed_2d[:, 1:-1, :]  # remove sos and eos frames
-        delayed_core_flat = delayed_core.reshape(b, -1)
-        Ec = self.recover_codes_from_delay(delayed_core_flat, t_ec).transpose(1, 2)
-        acoustic_ids, semantic_ids = self.split_interleaved_ec(Ec)
-        return acoustic_ids, semantic_ids
+
+if __name__=='__main__':
+    model = CustomLlamaModel(
+        hidden_size = 768,
+        num_layers = 8,
+        num_attention_heads = 8,
+    ).eval().cuda()
+
+    # inputs_embeds1 = torch.randn(1, 10, 256)
+    # inputs_embeds2 = torch.randn(1, 10, 256)
+    # inputs_embeds3 = torch.randn(1, 10, 256)
+    # out1 = model.llm_forward(torch.cat([inputs_embeds1, inputs_embeds2], dim=1)).last_hidden_state
+    # out2 = model.llm_forward(torch.cat([inputs_embeds1, inputs_embeds3], dim=1)).last_hidden_state
+
+    # print((out1[:, :10] - out2[:, :10]).abs().sum())
+
+    # inputs_embeds = torch.randn(1, 10, 256)
+    # out1 = model.llm_forward(inputs_embeds).last_hidden_state
+    # out2 = model.test_generate(inputs_embeds)
+
+    # print((out1[:, :10] - out2[:, :10]).abs().sum())
+
+    # global_ids = torch.randint(0, 4096, (1, 32)).cuda()
+    # semantic_ids = torch.randint(0, 8192, (1, 100)).cuda()
+
+    # # import ipdb; ipdb.set_trace()
+    # loss = model(global_ids, semantic_ids)
+    # print(loss)
+
+    # global_ids, semantic_ids = model.generate(input_ids=None)
+    print(sum([p.numel() for p in model.parameters()]))
+
