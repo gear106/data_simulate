@@ -18,12 +18,6 @@ from .llm.llm_sft_hcodec import LLM_SFT_HCodec
 from transformers import AutoModel
 
 logger = logging.getLogger(__name__)
-if not logger.handlers:
-    _handler = logging.StreamHandler()
-    _handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
-    logger.addHandler(_handler)
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
 
 
 class ModelHCodec(pl.LightningModule):
@@ -103,13 +97,13 @@ class ModelHCodec(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         mode, enroll, mix, speech, interf, fs, lengths, names = batch
-        logger.info(f"[train step {batch_idx}] mode={mode} start")
 
         if mode == 'rtse':
             acoustic_codes, semantic_codes = self.tokenizer.tokenize(interf)  # (b, 4, T_a), (b, 4, T_s)
         else:
             acoustic_codes, semantic_codes = self.tokenizer.tokenize(speech)  # (b, 4, T_a), (b, 4, T_s)
-        logger.info(f"[train step {batch_idx}] tokenize done")
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
         mix_mel = self.stft_logmel(mix)
         mix_feats = self.extract_semantic_features(mix)
@@ -118,7 +112,8 @@ class ModelHCodec(pl.LightningModule):
             enroll_feats = self.extract_semantic_features(enroll)
         else:
             enroll_mel, enroll_feats = None, None
-        logger.info(f"[train step {batch_idx}] features done")
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
         loss, acc = self.dnn(
             task_name=mode,
@@ -129,11 +124,11 @@ class ModelHCodec(pl.LightningModule):
             acoustic_ids=acoustic_codes,
             semantic_ids=semantic_codes,
         )
-        logger.info(f"[train step {batch_idx}] dnn forward done, loss={loss.item():.4f}")
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
         self.log_dict({'train_loss': loss, 'train_acc': acc}, on_step=True, on_epoch=True, prog_bar=True)
         self.current_traning_step += 1
-        logger.info(f"[train step {batch_idx}] return")
         return loss
 
     def on_train_epoch_end(self):
@@ -177,9 +172,37 @@ class ModelHCodec(pl.LightningModule):
 
     def _reshape_generated_tokens(self, acoustic_ids: torch.Tensor, semantic_ids: torch.Tensor,
                                   acoustic_t: int, semantic_t: int):
-        """Reshape flattened delay-pattern token IDs back to (B, 4, T) for HCodec detokenize."""
-        acoustic_codes = self.dnn.recover_codes_from_delay(acoustic_ids, acoustic_t)
-        semantic_codes = self.dnn.recover_codes_from_delay(semantic_ids, semantic_t)
+        """Reshape flattened delay-pattern token IDs back to (B, 4, T) for HCodec detokenize.
+
+        The generated flattened length is always (T + 3) * 4. We infer the actual T from the
+        token length instead of relying on the caller-supplied acoustic_t/semantic_t, which can
+        drift from the generated length due to padding / segmentation mismatches.
+        """
+        n_q = self.dnn.NUM_QUANTIZERS
+
+        def _infer_t(delayed_ids: torch.Tensor) -> int:
+            length = delayed_ids.size(1)
+            if length % n_q != 0:
+                raise ValueError(
+                    f"Delayed token length {length} is not divisible by n_q={n_q}"
+                )
+            inferred = length // n_q - n_q + 1
+            if inferred <= 0:
+                raise ValueError(f"Cannot infer T from delayed token length {length} (n_q={n_q})")
+            return inferred
+
+        acoustic_t_inferred = _infer_t(acoustic_ids)
+        semantic_t_inferred = _infer_t(semantic_ids)
+
+        if acoustic_t_inferred != acoustic_t or semantic_t_inferred != semantic_t:
+            logger.warning(
+                f"Token length mismatch: requested (acoustic_t={acoustic_t}, semantic_t={semantic_t}) "
+                f"but inferred (acoustic_t={acoustic_t_inferred}, semantic_t={semantic_t_inferred}) "
+                f"from generated lengths (acoustic={acoustic_ids.size(1)}, semantic={semantic_ids.size(1)})"
+            )
+
+        acoustic_codes = self.dnn.recover_codes_from_delay(acoustic_ids, acoustic_t_inferred)
+        semantic_codes = self.dnn.recover_codes_from_delay(semantic_ids, semantic_t_inferred)
         return acoustic_codes, semantic_codes
 
     def test_step(self, batch, batch_idx):
