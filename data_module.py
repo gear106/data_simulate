@@ -336,6 +336,11 @@ class LLM_SFT_HCodec(CustomLlamaModel):
             rel_pos += 1
         acoustic_delayed = torch.cat(acoustic_outputs, dim=-1)
 
+        # Advance KV-cache one more step with the last acoustic token so that
+        # semantic_sos is consumed at the same position as in training.
+        _ = step(input_ids, rel_pos)
+        rel_pos += 1
+
         # Emit semantic_sos deterministically and update KV-cache.
         semantic_sos = torch.full((b, 1), self.semantic_sos_token_id, dtype=torch.long, device=device)
         semantic_sos_embeds = self.embed_with_delay(semantic_sos, start_pos=rel_pos)
