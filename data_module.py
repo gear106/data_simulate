@@ -7,21 +7,21 @@ from .llm import CustomLlamaModel
 
 
 class LLM_SFT_HCodec(CustomLlamaModel):
-    """SFT LLM for HCodec tokens with delay pattern.
+    """SFT LLM for HCodec tokens with interleaved delay pattern.
 
     Following the UniTok paper:
       - HCodec produces 4-layer acoustic and semantic tokens (B, 4, T).
-      - Tokens are interleaved across time steps and shifted per layer (delay
-        pattern), with special pad tokens occupying empty positions.
+      - Acoustic and semantic frames are interleaved into a single 50 Hz Ec
+        sequence: [codec_sos, A0, S0, A1, S1, ..., codec_eos].
+      - A single delay pattern is applied to Ec, with special pad tokens
+        occupying empty positions.
       - The LM backbone uses 4 independent embedding layers and 4 independent
         output heads, one per RVQ layer.
-      - Embeddings for each layer are selected by position and summed into the
-        transformer input (here, selected by position; conceptually equivalent to
-        per-layer lookup).
+      - Embeddings for each layer are selected by position.
     """
 
     NUM_QUANTIZERS = 4
-    NUM_SPECIAL_TOKENS = 4  # pad, acoustic_sos, semantic_sos, semantic_eos
+    NUM_SPECIAL_TOKENS = 3  # pad, codec_sos, codec_eos
 
     def __init__(
         self,
@@ -44,9 +44,8 @@ class LLM_SFT_HCodec(CustomLlamaModel):
         self.vocab_size = self.codebook_size + self.NUM_SPECIAL_TOKENS
         self.config.vocab_size = self.vocab_size
         self.pad_token_id = self.codebook_size
-        self.acoustic_sos_token_id = self.codebook_size + 1
-        self.semantic_sos_token_id = self.codebook_size + 2
-        self.semantic_eos_token_id = self.codebook_size + 3
+        self.codec_sos_token_id = self.codebook_size + 1
+        self.codec_eos_token_id = self.codebook_size + 2
 
         # 4 independent embedding layers, one per RVQ layer.
         del self.codec_embedding
@@ -110,6 +109,51 @@ class LLM_SFT_HCodec(CustomLlamaModel):
         for q in range(n_q):
             codes[:, q, :] = delayed_2d[:, q:q + t, q]
         return codes
+
+    def build_interleaved_ec(
+        self,
+        acoustic_ids: Union[torch.IntTensor, torch.LongTensor],
+        semantic_ids: Union[torch.IntTensor, torch.LongTensor],
+    ) -> torch.Tensor:
+        """Build interleaved 50 Hz Ec from 25 Hz acoustic/semantic tokens.
+
+        Ec = [A0, S0, A1, S1, A2, S2, ...]
+        """
+        b, n_q, t_a = acoustic_ids.shape
+        _, _, t_s = semantic_ids.shape
+        assert n_q == self.NUM_QUANTIZERS
+        if t_a != t_s:
+            raise ValueError(
+                f"acoustic and semantic time steps must match: got {t_a} and {t_s}"
+            )
+        t = t_a + t_s  # interleaved acoustic/semantic frames
+        Ec = torch.empty(
+            (b, t, n_q),
+            dtype=acoustic_ids.dtype,
+            device=acoustic_ids.device,
+        )
+        # Even positions are acoustic; odd positions are semantic.
+        Ec[:, ::2, :] = acoustic_ids.transpose(1, 2)
+        Ec[:, 1::2, :] = semantic_ids.transpose(1, 2)
+        return Ec
+
+    def split_interleaved_ec(
+        self,
+        Ec: Union[torch.IntTensor, torch.LongTensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Split interleaved Ec back into acoustic and semantic codes.
+
+        Returns:
+            acoustic_ids: (B, 4, T_a)
+            semantic_ids: (B, 4, T_s)
+        """
+        t = Ec.size(1)
+        if t % 2 != 0:
+            raise ValueError(f"Ec time steps {t} must be even")
+        t_a = t // 2
+        acoustic_ids = Ec[:, ::2, :].transpose(1, 2)
+        semantic_ids = Ec[:, 1::2, :].transpose(1, 2)
+        return acoustic_ids, semantic_ids
 
     def _layer_ids_for_length(self, length: int, device: torch.device) -> torch.Tensor:
         """Return the RVQ layer index for each position in a length-L sequence."""
@@ -179,35 +223,37 @@ class LLM_SFT_HCodec(CustomLlamaModel):
         acoustic_ids: Union[torch.IntTensor, torch.LongTensor],  # (B, 4, T_a)
         semantic_ids: Union[torch.IntTensor, torch.LongTensor],  # (B, 4, T_s)
     ):
-        delayed_acoustic, mask_a = self.build_delay_pattern(acoustic_ids)
-        delayed_semantic, mask_s = self.build_delay_pattern(semantic_ids)
+        # Interleave acoustic/semantic frames into a single 50 Hz Ec, apply the
+        # delay pattern, then prepend a codec_sos frame and append a codec_eos
+        # frame (one per RVQ layer), matching MusicGen's pattern layout.
+        Ec = self.build_interleaved_ec(acoustic_ids, semantic_ids)
+        delayed_ids, _ = self.build_delay_pattern(Ec.transpose(1, 2))
 
-        b = delayed_acoustic.size(0)
-        device = delayed_acoustic.device
+        b = delayed_ids.size(0)
+        device = delayed_ids.device
+        n_q = self.NUM_QUANTIZERS
+        t_ec = Ec.size(1)
+        seq_steps = t_ec + n_q - 1  # steps from the core delay pattern
 
-        acoustic_sos = torch.full(
-            (b, 1), self.acoustic_sos_token_id, dtype=torch.long, device=device
+        # Reshape to (B, seq_steps, n_q) to add sos/eos frames.
+        delayed_2d = delayed_ids.reshape(b, seq_steps, n_q)
+        delayed_with_se = torch.full(
+            (b, seq_steps + 2, n_q),
+            self.pad_token_id,
+            dtype=delayed_ids.dtype,
+            device=device,
         )
-        semantic_sos = torch.full(
-            (b, 1), self.semantic_sos_token_id, dtype=torch.long, device=device
-        )
-        semantic_eos = torch.full(
-            (b, 1), self.semantic_eos_token_id, dtype=torch.long, device=device
-        )
+        delayed_with_se[:, 0, :] = self.codec_sos_token_id
+        delayed_with_se[:, 1:-1, :] = delayed_2d
+        delayed_with_se[:, -1, :] = self.codec_eos_token_id
+        delayed_ids = delayed_with_se.reshape(b, -1)
+        mask = delayed_ids != self.pad_token_id
 
-        # [acoustic_sos, delayed_acoustic, semantic_sos, delayed_semantic]
-        input_ids = torch.cat(
-            [acoustic_sos, delayed_acoustic, semantic_sos, delayed_semantic], dim=1
-        )
-        # [delayed_acoustic, semantic_sos, delayed_semantic, semantic_eos]
-        target_ids = torch.cat(
-            [delayed_acoustic, semantic_sos, delayed_semantic, semantic_eos], dim=1
-        )
-        loss_mask = torch.cat(
-            [mask_a, torch.ones(b, 1, dtype=torch.bool, device=device),
-             mask_s, torch.ones(b, 1, dtype=torch.bool, device=device)],
-            dim=1,
-        )
+        # Causal LM: input is delayed sequence without last token; target is
+        # delayed sequence shifted by one position.
+        input_ids = delayed_ids[:, :-1]
+        target_ids = delayed_ids[:, 1:]
+        loss_mask = mask[:, 1:]
 
         # Condition embeddings.
         task_embeds = self.task_embedding(
@@ -258,19 +304,19 @@ class LLM_SFT_HCodec(CustomLlamaModel):
         top_p: float = 0.95,
         do_sample: bool = True,
     ):
-        """Generate flattened delay-pattern tokens for acoustic and semantic RVQ.
+        """Generate flattened delay-pattern tokens for the interleaved Ec sequence.
 
-        Defaults assume mix_mel is 50 Hz, HCodec acoustic tokens are 50 Hz and
-        semantic tokens are 25 Hz. Pass ``acoustic_t`` / ``semantic_t`` to override.
+        Defaults assume mix_mel is 50 Hz and both HCodec acoustic and semantic
+        tokens are 25 Hz. Pass ``acoustic_t`` / ``semantic_t`` to override.
         """
         if acoustic_t is None:
-            acoustic_t = mix_mel.size(1)
+            acoustic_t = mix_mel.size(1) // 2
         if semantic_t is None:
             semantic_t = mix_mel.size(1) // 2
 
         n_q = self.NUM_QUANTIZERS
-        acoustic_len = (acoustic_t + n_q - 1) * n_q
-        semantic_len = (semantic_t + n_q - 1) * n_q
+        t_ec = acoustic_t + semantic_t  # interleaved acoustic/semantic frames
+        total_len = (t_ec + n_q + 1) * n_q  # + sos frame + eos frame
 
         device = mix_mel.device
         b = mix_mel.size(0)
@@ -298,15 +344,15 @@ class LLM_SFT_HCodec(CustomLlamaModel):
         current_output = self.llm_forward(cond_embeds, past_key_values=None, use_cache=True)
         past_key_values = current_output.past_key_values
 
-        # Relative position within the generated token sequence. The first generated
-        # token (acoustic_sos) is at relative position 0; subsequent tokens increment
-        # by 1. Embedding layer and output head are selected by this relative position
-        # so that inference matches the delay pattern used during training.
+        # Relative position within the generated token sequence. The first
+        # generated token (codec_sos) is at relative position 0; subsequent
+        # tokens increment by 1. Embedding/output head are selected by this
+        # relative position so that inference matches training.
         rel_pos = 0
 
         # Helper to run one autoregressive step at a known relative position.
         def step(input_ids: torch.Tensor, pos: int) -> torch.Tensor:
-            nonlocal past_key_values, rel_pos
+            nonlocal past_key_values
             inputs_embeds = self.embed_with_delay(input_ids, start_pos=pos)
             current_output = self.llm_forward(
                 inputs_embeds,
@@ -326,40 +372,37 @@ class LLM_SFT_HCodec(CustomLlamaModel):
             )
             return next_token
 
-        # Generate acoustic delay pattern.
-        input_ids = torch.full((b, 1), self.acoustic_sos_token_id, dtype=torch.long, device=device)
-        acoustic_outputs = []
-        for _ in range(acoustic_len):
-            next_token = step(input_ids, rel_pos)
-            acoustic_outputs.append(next_token)
-            input_ids = next_token
-            rel_pos += 1
-        acoustic_delayed = torch.cat(acoustic_outputs, dim=-1)
-
-        # Advance KV-cache one more step with the last acoustic token so that
-        # semantic_sos is consumed at the same position as in training.
-        _ = step(input_ids, rel_pos)
-        rel_pos += 1
-
-        # Emit semantic_sos deterministically and update KV-cache.
-        semantic_sos = torch.full((b, 1), self.semantic_sos_token_id, dtype=torch.long, device=device)
-        semantic_sos_embeds = self.embed_with_delay(semantic_sos, start_pos=rel_pos)
-        current_output = self.llm_forward(
-            semantic_sos_embeds,
-            past_key_values=past_key_values,
-            use_cache=True,
+        # The delayed sequence starts with a full codec_sos frame and ends with a
+        # full codec_eos frame; both are emitted deterministically.
+        input_ids = torch.full(
+            (b, 1), self.codec_sos_token_id, dtype=torch.long, device=device
         )
-        past_key_values = current_output.past_key_values
-        input_ids = semantic_sos
-        rel_pos += 1
-
-        # Generate semantic delay pattern.
-        semantic_outputs = []
-        for _ in range(semantic_len):
+        generated = []
+        for pos in range(total_len - 1):
             next_token = step(input_ids, rel_pos)
-            semantic_outputs.append(next_token)
+            # Force the first full frame (positions 1..n_q-1) to codec_sos.
+            if pos < n_q - 1:
+                next_token = torch.full(
+                    (b, 1), self.codec_sos_token_id, dtype=torch.long, device=device
+                )
+            # Force the last full frame (positions total_len-n_q..total_len-1) to codec_eos.
+            if pos >= total_len - n_q - 1:
+                next_token = torch.full(
+                    (b, 1), self.codec_eos_token_id, dtype=torch.long, device=device
+                )
+            generated.append(next_token)
             input_ids = next_token
             rel_pos += 1
-        semantic_delayed = torch.cat(semantic_outputs, dim=-1)
+        delayed_ids = torch.cat(
+            [torch.full((b, 1), self.codec_sos_token_id, dtype=torch.long, device=device)]
+            + generated,
+            dim=-1,
+        )
 
-        return acoustic_delayed, semantic_delayed
+        # Recover interleaved Ec: strip sos/eos frames, undo delay pattern, split.
+        delayed_2d = delayed_ids.reshape(b, t_ec + n_q + 1, n_q)
+        delayed_core = delayed_2d[:, 1:-1, :]  # remove sos and eos frames
+        delayed_core_flat = delayed_core.reshape(b, -1)
+        Ec = self.recover_codes_from_delay(delayed_core_flat, t_ec).transpose(1, 2)
+        acoustic_ids, semantic_ids = self.split_interleaved_ec(Ec)
+        return acoustic_ids, semantic_ids
