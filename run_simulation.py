@@ -1,69 +1,341 @@
 import numpy as np
-import librosa
-from scipy.signal import stft
+import pytorch_lightning as pl
+import torch
+from torch import nn
+import torch.nn.functional as F
+from torchaudio.functional import melscale_fbanks
+from pathlib import Path
+import soundfile as sf
+import time
+import math
+import random
+import logging
 
-def estimate_snr_practical(noisy_speech_path, noise_only_path, 
-                           frame_length=512, hop_length=256):
-    """
-    基于静音段参考的SNR估计
-    输入: 带噪语音wav, 纯噪声wav
-    输出: 全局SNR, 分段SNR分布, 频域SNR
-    """
-    # 加载（强制同采样率）
-    s_n, sr = librosa.load(noisy_speech_path, sr=None)
-    n_only, _ = librosa.load(noise_only_path, sr=sr)
-    
-    # 确保噪声样本足够，不够则循环拼接
-    if len(n_only) < len(s_n):
-        repeats = int(np.ceil(len(s_n) / len(n_only)))
-        n_only = np.tile(n_only, repeats)[:len(s_n)]
-    
-    # ========== 方法1: 全局能量SNR（对标设备规格书）==========
-    P_noise = np.mean(n_only ** 2)
-    P_total = np.mean(s_n ** 2)
-    P_signal = max(P_total - P_noise, 1e-12)
-    
-    snr_global = 10 * np.log10(P_signal / P_noise)
-    
-    # ========== 方法2: 分段SNR（更鲁棒，反映时域波动）==========
-    # 分帧计算
-    frames_total = librosa.util.frame(s_n, frame_length=frame_length, hop_length=hop_length)
-    frames_noise = librosa.util.frame(n_only[:len(s_n)], frame_length=frame_length, hop_length=hop_length)
-    
-    # 每帧功率
-    P_total_frames = np.mean(frames_total ** 2, axis=0)
-    P_noise_frames = np.mean(frames_noise ** 2, axis=0)
-    P_signal_frames = np.maximum(P_total_frames - P_noise_frames, 1e-12)
-    
-    snr_frames = 10 * np.log10(P_signal_frames / P_noise_frames)
-    snr_median = np.median(snr_frames)  # 中位数比均值更抗异常帧
-    
-    # ========== 方法3: 频域SNR（看哪些频段被污染严重）==========
-    _, _, Z_s = stft(s_n, fs=sr, nperseg=frame_length, noverlap=frame_length-hop_length)
-    _, _, Z_n = stft(n_only[:len(s_n)], fs=sr, nperseg=frame_length, noverlap=frame_length-hop_length)
-    
-    # 功率谱
-    P_s = np.mean(np.abs(Z_s) ** 2, axis=1)
-    P_n = np.mean(np.abs(Z_n) ** 2, axis=1)
-    P_sig = np.maximum(P_s - P_n, 1e-12)
-    
-    snr_freq = 10 * np.log10(P_sig / P_n)
-    freqs = np.fft.rfftfreq(frame_length, 1/sr)
-    
-    return {
-        'snr_global_db': float(snr_global),
-        'snr_median_db': float(snr_median),
-        'snr_frames_db': snr_frames,           # 时域分布
-        'snr_per_freq_db': snr_freq,           # 频域分布
-        'freqs': freqs,
-        'sr': sr
-    }
-result = estimate_snr_practical("noisy_speech.wav", "silence.wav")
+from .HCodec.audio_tokenizer import HCodecTokenizer
+from .llm.llm_sft_hcodec import LLM_SFT_HCodec
 
-print(f"全局SNR: {result['snr_global_db']:.1f} dB")
-print(f"中位数分段SNR: {result['snr_median_db']:.1f} dB")
 
-# 看频域细节：哪些频段噪声大
-for f, snr in zip(result['freqs'][::10], result['snr_per_freq_db'][::10]):
-    if f <= 8000:  # 只看8kHz以内
-        print(f"{f:.0f}Hz: {snr:.1f} dB")
+from transformers import AutoModel
+
+logger = logging.getLogger(__name__)
+
+
+class ModelHCodec(pl.LightningModule):
+    def __init__(self, config):
+        super().__init__()
+        self.save_hyperparameters()
+        self.config = config
+        self.stft_conf = config['stft_config']
+
+        # HCodec tokenizer expects a checkpoint file rather than a directory.
+        codec_ckpt = Path(config['codec_ckpt_dir'])
+        if codec_ckpt.is_dir():
+            codec_ckpt = codec_ckpt / 'weights.pt'
+        self.tokenizer = HCodecTokenizer(pt_path=codec_ckpt)
+        self.dnn = LLM_SFT_HCodec(**config['llm_config'])
+
+        self.semantic_model = AutoModel.from_pretrained("microsoft/wavlm-base-plus").eval()
+        self.semantic_model.requires_grad_(False)
+
+        self.current_traning_step = -1
+
+        # self.automatic_optimization = False
+
+    @torch.no_grad()
+    def extract_semantic_features(self, wavs: torch.Tensor) -> torch.Tensor:
+        """extract wav2vec2 features"""
+        # wavs: (b,t)
+        wavs = F.pad(wavs, (160, 160))
+
+        feats = self.semantic_model(wavs, output_hidden_states=True)
+        feats_mix = torch.stack(feats.hidden_states, dim=1).mean(1)
+
+        return feats_mix.detach()
+
+    def stft_logmel(self, x):
+        # x:(B,T)
+        assert x.ndim == 2
+        hop_length = self.stft_conf['hop_length']
+        win_length = self.stft_conf['win_length']
+        n_fft = self.stft_conf['n_fft']
+        n_mels = self.stft_conf['n_mels']
+
+        pad_length = math.ceil(x.size(-1) / hop_length) * hop_length - x.size(-1)
+        x = torch.nn.functional.pad(x, ((win_length - hop_length) // 2, pad_length + (win_length - hop_length) // 2))
+        spec = torch.stft(
+            x,
+            n_fft,
+            hop_length,
+            win_length=win_length,
+            window=torch.hann_window(win_length).to(x.device),
+            onesided=True,
+            center=False,
+            return_complex=True,
+        ).transpose(1, 2)  # (B,T,F)
+        if not hasattr(self, 'fb'):
+            fb = melscale_fbanks(n_freqs=n_fft // 2 + 1, f_min=0.0, f_max=8000.0, n_mels=n_mels, sample_rate=16000)
+            setattr(self, 'fb', fb.to(x.device))
+        mag = spec.abs()  # (b,t,f)
+        mel = mag @ self.fb  # (B,T,M)
+        mel = torch.log(mel + 1e-10)
+        return mel
+
+    # 重写 state_dict: 排除 tokenizer semantic_model
+    def state_dict(self, *args, **kwargs):
+        state = super().state_dict(*args, **kwargs)
+        for key in list(state.keys()):
+            if key.startswith('tokenizer.') or key.startswith('semantic_model.'):
+                del state[key]
+        return state
+
+    # 重写 load_state_dict: 排除 tokenizer
+    def load_state_dict(self, state_dict, strict=True):
+        super().load_state_dict(state_dict, strict=False)
+
+    def forward(self, batch):
+        pass
+
+    def training_step(self, batch, batch_idx):
+        mode, enroll, mix, speech, interf, fs, lengths, names = batch
+
+        if mode == 'rtse':
+            acoustic_codes, semantic_codes = self.tokenizer.tokenize(interf)  # (b, 4, T_a), (b, 4, T_s)
+        else:
+            acoustic_codes, semantic_codes = self.tokenizer.tokenize(speech)  # (b, 4, T_a), (b, 4, T_s)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        mix_mel = self.stft_logmel(mix)
+        mix_feats = self.extract_semantic_features(mix)
+        if enroll is not None:
+            enroll_mel = self.stft_logmel(enroll)
+            enroll_feats = self.extract_semantic_features(enroll)
+        else:
+            enroll_mel, enroll_feats = None, None
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        loss, acc = self.dnn(
+            task_name=mode,
+            enroll_mel=enroll_mel,
+            enroll_feats=enroll_feats,
+            mix_mel=mix_mel,
+            mix_feats=mix_feats,
+            acoustic_ids=acoustic_codes,
+            semantic_ids=semantic_codes,
+        )
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        self.log_dict({'train_loss': loss, 'train_acc': acc}, on_step=True, on_epoch=True, prog_bar=True)
+        self.current_traning_step += 1
+        return loss
+
+    def on_train_epoch_end(self):
+        pass
+
+    def validation_step(self, batch, batch_idx):
+        mode, enroll, mix, speech, interf, fs, lengths, names = batch
+
+        if mode == 'rtse':
+            acoustic_codes, semantic_codes = self.tokenizer.tokenize(interf)  # (b, 4, T_a), (b, 4, T_s)
+        else:
+            acoustic_codes, semantic_codes = self.tokenizer.tokenize(speech)  # (b, 4, T_a), (b, 4, T_s)
+
+        mix_mel = self.stft_logmel(mix)
+        mix_feats = self.extract_semantic_features(mix)
+        if enroll is not None:
+            enroll_mel = self.stft_logmel(enroll)
+            enroll_feats = self.extract_semantic_features(enroll)
+        else:
+            enroll_mel, enroll_feats = None, None
+
+        loss, acc = self.dnn(
+            task_name=mode,
+            enroll_mel=enroll_mel,
+            enroll_feats=enroll_feats,
+            mix_mel=mix_mel,
+            mix_feats=mix_feats,
+            acoustic_ids=acoustic_codes,
+            semantic_ids=semantic_codes,
+        )
+
+        self.log_dict({'valid_loss': loss, 'valid_acc': acc}, on_step=False, on_epoch=True, sync_dist=True)
+
+    def on_validation_epoch_end(self):
+        # save ckpt when validation epoch finished
+        if not self.trainer.sanity_checking:
+            epoch = self.current_epoch
+            step = self.current_traning_step
+            ckpt_name = f'epoch={epoch}-step={step}.ckpt'
+            self.trainer.save_checkpoint(self.config['ckpt_dir'] / ckpt_name)
+
+    def test_step(self, batch, batch_idx):
+        mode, enroll, src, tgt, fs, lengths, names = batch
+
+        do_sample = False
+        if mode == 'se':
+            seg_len = 5 * 16000
+            pad_len = math.ceil(src.size(-1) / seg_len) * seg_len - src.size(-1)
+            seg_src = np.pad(src.cpu().numpy(), [(0, 0), (0, pad_len)], 'wrap')
+            seg_src = torch.from_numpy(seg_src).to(src.device)
+            seg_src = seg_src.reshape(-1, seg_len)
+            seg_src = seg_src / src.abs().max(dim=-1, keepdim=True)[0]
+
+            mix_mel = self.stft_logmel(seg_src)
+            mix_feats = self.extract_semantic_features(seg_src)
+            acoustic_ids, semantic_ids = self.dnn.generate(
+                task_name='se',
+                enroll_mel=None,
+                enroll_feats=None,
+                mix_mel=mix_mel,
+                mix_feats=mix_feats,
+                do_sample=do_sample,
+            )
+            acoustic_codes, semantic_codes = acoustic_ids, semantic_ids
+            est = self.tokenizer.detokenize(acoustic_codes, semantic_codes).squeeze(1)  # (B,t)
+            est = est.reshape(-1)[:src.size(-1)]
+            est = est.cpu().numpy()
+
+            if 'save_enhanced' in self.config and self.config['save_enhanced'] is not None:
+                sf.write(Path(self.config['save_enhanced']) / f'{names[0]}.wav', est, samplerate=int(fs[0]))
+
+        elif mode == 'tse':
+            seg_len = 5 * 16000
+            pad_len = math.ceil(src.size(-1) / seg_len) * seg_len - src.size(-1)
+            seg_src = np.pad(src.cpu().numpy(), [(0, 0), (0, pad_len)], 'wrap')
+            seg_src = torch.from_numpy(seg_src).to(src.device)
+            seg_src = seg_src.reshape(-1, seg_len)
+
+            enroll_mel = self.stft_logmel(enroll)
+            enroll_feats = self.extract_semantic_features(enroll)
+            enroll_mel = torch.cat([enroll_mel for _ in range(seg_src.size(0))], dim=0)
+            enroll_feats = torch.cat([enroll_feats for _ in range(seg_src.size(0))], dim=0)
+
+            mix_mel = self.stft_logmel(seg_src)
+            mix_feats = self.extract_semantic_features(seg_src)
+            acoustic_ids, semantic_ids = self.dnn.generate(
+                task_name='tse',
+                enroll_mel=enroll_mel,
+                enroll_feats=enroll_feats,
+                mix_mel=mix_mel,
+                mix_feats=mix_feats,
+                do_sample=do_sample,
+            )
+            acoustic_codes, semantic_codes = acoustic_ids, semantic_ids
+            est = self.tokenizer.detokenize(acoustic_codes, semantic_codes).squeeze(1)  # (B,t)
+            est = est.reshape(-1)[:src.size(-1)]
+            est = est.cpu().numpy()
+
+            if 'save_enhanced' in self.config and self.config['save_enhanced'] is not None:
+                sf.write(Path(self.config['save_enhanced']) / f'{names[0]}.wav', est, samplerate=int(fs[0]))
+
+        elif mode == 'ss':
+            seg_len = 5 * 16000
+            if src.size(-1) > seg_len:
+                seg_src = src[:, :seg_len]
+            else:
+                seg_src = np.pad(src.cpu().numpy(), [(0, 0), (0, seg_len - src.size(-1))], 'wrap')
+                seg_src = torch.from_numpy(seg_src).to(src.device)
+
+            mix_mel = self.stft_logmel(seg_src)
+            mix_feats = self.extract_semantic_features(seg_src)
+            acoustic_ids, semantic_ids = self.dnn.generate(
+                task_name='se',
+                enroll_mel=None,
+                enroll_feats=None,
+                mix_mel=mix_mel,
+                mix_feats=mix_feats,
+                do_sample=do_sample,
+            )
+            acoustic_codes, semantic_codes = acoustic_ids, semantic_ids
+            enroll = self.tokenizer.detokenize(acoustic_codes, semantic_codes).squeeze(1)  # (1,t)
+            enroll = enroll[:, :seg_len]
+            enroll = enroll / (torch.max(torch.abs(enroll)) + 1e-5) * 0.99
+            enroll_mel = self.stft_logmel(enroll)
+            enroll_feats = self.extract_semantic_features(enroll)
+
+            pad_len = math.ceil(src.size(-1) / seg_len) * seg_len - src.size(-1)
+            seg_src = np.pad(src.cpu().numpy(), [(0, 0), (0, pad_len)], 'wrap')
+            seg_src = torch.from_numpy(seg_src).to(src.device)
+            seg_src = seg_src.reshape(-1, seg_len)
+            enroll_mel = torch.cat([enroll_mel for _ in range(seg_src.size(0))], dim=0)
+            enroll_feats = torch.cat([enroll_feats for _ in range(seg_src.size(0))], dim=0)
+            mix_mel = self.stft_logmel(seg_src)
+            mix_feats = self.extract_semantic_features(seg_src)
+            acoustic_ids, semantic_ids = self.dnn.generate(
+                task_name='tse',
+                enroll_mel=enroll_mel,
+                enroll_feats=enroll_feats,
+                mix_mel=mix_mel,
+                mix_feats=mix_feats,
+                do_sample=do_sample,
+            )
+            acoustic_codes, semantic_codes = acoustic_ids, semantic_ids
+            est = self.tokenizer.detokenize(acoustic_codes, semantic_codes).squeeze(1)  # (B,t)
+            est = est.reshape(-1)[:src.size(-1)].cpu().numpy()
+            if 'save_enhanced' in self.config and self.config['save_enhanced'] is not None:
+                sf.write(Path(self.config['save_enhanced']) / f'{names[0]}_s1.wav', est, samplerate=int(fs[0]))
+
+            acoustic_ids, semantic_ids = self.dnn.generate(
+                task_name='rtse',
+                enroll_mel=enroll_mel,
+                enroll_feats=enroll_feats,
+                mix_mel=mix_mel,
+                mix_feats=mix_feats,
+                do_sample=do_sample,
+            )
+            acoustic_codes, semantic_codes = acoustic_ids, semantic_ids
+            est = self.tokenizer.detokenize(acoustic_codes, semantic_codes).squeeze(1)  # (B,t)
+            est = est.reshape(-1)[:src.size(-1)].cpu().numpy()
+            if 'save_enhanced' in self.config and self.config['save_enhanced'] is not None:
+                sf.write(Path(self.config['save_enhanced']) / f'{names[0]}_s2.wav', est, samplerate=int(fs[0]))
+
+    def on_test_epoch_end(self):
+        pass
+
+    @torch.inference_mode()
+    def generate(self, task_name, enroll, mixture):
+        # cond: (B, T)
+        if enroll is not None:
+            enroll = self.stft_logmel(enroll)
+        length = mixture.size(-1)
+        mixture = self.stft_logmel(mixture)
+
+        acoustic_codes, semantic_codes = self.dnn.generate(
+            task_name=task_name,
+            enroll_mel=enroll,
+            enroll_feats=None,
+            mix_mel=mixture,
+            mix_feats=None,
+            do_sample=True,
+        )
+        wav_rec = self.tokenizer.detokenize(acoustic_codes, semantic_codes)[..., :length]  # (1, t)
+
+        import soundfile as sf
+        sf.write('test.wav', wav_rec.squeeze().cpu().numpy(), 16000)
+
+    def on_save_checkpoint(self, ckpt):
+        ckpt['current_traning_step'] = self.current_traning_step
+
+    def on_load_checkpoint(self, ckpt):
+        self.current_traning_step = ckpt['current_traning_step']
+
+    def configure_optimizers(self):
+        opt = torch.optim.AdamW(self.dnn.parameters(), **self.config['opt'])
+
+        def warmup_lambda(step):
+            warmup_steps = self.config['sch']['warmup_steps']
+            step_decay = self.config['sch']['step_decay']
+            if step < warmup_steps:
+                return 0.5 * (1 + math.cos(math.pi * (1 - step / warmup_steps)))
+            else:
+                return max(step_decay ** (step - warmup_steps), self.config['sch']['min_factor'])
+
+        sch = {
+            'scheduler': torch.optim.lr_scheduler.LambdaLR(opt, warmup_lambda),
+            'interval': 'step',
+            'frequency': 1,
+        }
+
+        return [opt], [sch]
