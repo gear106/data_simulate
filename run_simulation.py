@@ -11,6 +11,14 @@
 两者差距越大，说明瓶颈在导向矢量估计；差距越小，说明瓶颈在 MVDR 方法本身。
 
 合成遵循 RealMAN 原文 3.5 节：原始录制电平【直接相加】，不设 coeff（-0.8dB 是自然结果）。
+
+
+# 两种模式都跑（推荐）
+python run_mvdr_eval.py \
+  --speech_pat '.../ma_speech/.../XXX_CH{ch}.flac' \
+  --noise_pat '.../ma_noise/.../YYY_CH{ch}.flac' \
+  --ref '.../dp_speech/.../XXX.flac' \
+  --out out.wav --channels 0-31 --mode both
 """
 import os
 import argparse
