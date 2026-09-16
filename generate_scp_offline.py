@@ -1,16 +1,4 @@
-import numpy as np, soundfile as sf
-from scipy.io import loadmat
-from scipy.signal import resample_poly
-import sys; sys.path.insert(0, '~/AmbiDrop')
-from ambidrop.asm import encode_ambisonics
-
-mic48, fs = sf.read('ex_1/p.wav')           # (T, 9)
-mic16 = resample_poly(mic48.T, 1, 3, axis=1) # 48k->16k
-
-V = loadmat('RealMAN9ch (simulated).mat')['V']
-grid = loadmat('Lebvedev2702.mat')
-anm, _ = encode_ambisonics(mic16, V, sh_order=2,
-                           th=grid['th'].squeeze(), ph=grid['ph'].squeeze())
-# anm: (9, T) —— 第0通道是A00
-for i in range(9):
-    sf.write(f'ch{i}.wav', anm[i] / (np.abs(anm[i]).max() + 1e-8), 16000)
+x 轴（3cm 等间距）：1@+3cm，9@+6，17@+9，26@+12，27@+15；5@−3，13@−6，21@−9，25@−12
+y 轴：3@+3cm，11@+6，19@+9；7@−3，15@−6，23@−9
+对角臂（NE 2/10/18，NW 4/12/20，SW 6/14/22，SE 8/16/24）：沿臂 3cm 间距 → mic 2/4/6/8 在 3cm 半径处，即 (±2.12, ±2.12) cm
+垂直方向：28@+4.5cm，29@+9cm；30@−4.5cm，31@−9cm
