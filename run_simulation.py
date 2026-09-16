@@ -1,179 +1,212 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-用 test_raw 的干净语音(ma_speech) + 纯噪声(ma_noise) 自己合成带噪语音，
-用 Enny1991/beamformers 的频域 MVDR 做波束形成，保存增强结果并对真值(dp_speech, mic0)评估。
+realman_ambidrop_pipeline.py
+============================
+用 AmbiDrop 官方仓库 (github.com/mikitt012/AmbiDrop) 的默认权重推理 RealMAN 测试集。
 
-支持两种导向矢量估计方式（可同时跑、并排对比）：
-  - practical（实用）：target=None，导向矢量从 "混合协方差 − 噪声协方差" 的主特征向量估计
-                        —— 不偷看真值，是 MVDR 的真实水平；
-  - oracle（神谕）  ：target=干净多通道语音，导向矢量直接用干净目标协方差估计
-                        —— 偷看真值，是 MVDR 的理论上限。
-两者差距越大，说明瓶颈在导向矢量估计；差距越小，说明瓶颈在 MVDR 方法本身。
+流程:
+    [阶段1] 生成 RealMAN 9通道阵列的 steering 矩阵 (.mat)   --> --step steering
+    [阶段2] 把 RealMAN 原始数据转成 AmbiDrop 评测目录结构   --> --step data
+    [阶段3] 打印/执行 run_Real_World.py 推理命令            --> --step run
 
-合成遵循 RealMAN 原文 3.5 节：原始录制电平【直接相加】，不设 coeff（-0.8dB 是自然结果）。
+用法示例:
+    python realman_ambidrop_pipeline.py --step all \\
+        --ambidrop-repo ~/AmbiDrop \\
+        --realman-root ~/datasets/RealMAN \\
+        --out-root ~/AmbiDrop/datasets/realman_eval
 
-
-# 两种模式都跑（推荐）
-python run_mvdr_eval.py \
-  --speech_pat '.../ma_speech/.../XXX_CH{ch}.flac' \
-  --noise_pat '.../ma_noise/.../YYY_CH{ch}.flac' \
-  --ref '.../dp_speech/.../XXX.flac' \
-  --out out.wav --channels 0-31 --mode both
+依赖: numpy scipy soundfile (阶段2还需要 resample: scipy.signal.resample_poly)
 """
-import os
+
 import argparse
+import os
+import sys
+import glob
+import subprocess
+
 import numpy as np
-import soundfile as sf
-from beamformers import beamformers
 
-FS = 16000  # 统一重采样到 16k
+# =====================================================================
+# 用户配置区 —— 按你的实际环境修改
+# =====================================================================
 
+# RealMAN 9通道子阵几何 (单位: 米), 顺序 = p.wav 通道顺序
+# ⚠️ 对角麦克风坐标务必与 RealMAN 数据集附带的几何文件核对!
+#    mic0 在原点; mic1/3/5/7 在 ±x/±y 轴 3cm; mic2/4/6/8 在对角 3cm 半径处
+MIC_POS = np.array([
+    [ 0.000,  0.000, 0.0],   # 0  center
+    [ 0.030,  0.000, 0.0],   # 1  +x
+    [ 0.0212, 0.0212, 0.0],  # 2  diag NE  (3cm/sqrt(2), 以数据集几何文件为准)
+    [ 0.000,  0.030, 0.0],   # 3  +y
+    [-0.0212, 0.0212, 0.0],  # 4  diag NW
+    [-0.030,  0.000, 0.0],   # 5  -x
+    [-0.0212,-0.0212, 0.0],  # 6  diag SW
+    [ 0.000, -0.030, 0.0],   # 7  -y
+    [ 0.0212,-0.0212, 0.0],  # 8  diag SE
+])
 
-# ---------------- IO ----------------
-def load_mc(path_pattern: str, channels, target_sr=FS):
-    """读多通道 flac，path_pattern 用 {ch} 占位通道号。返回 [C, T] float32"""
-    wavs = []
-    sr0 = None
-    for c in channels:
-        p = path_pattern.format(ch=c)
-        if not os.path.exists(p):
-            raise FileNotFoundError(p)
-        w, sr = sf.read(p, dtype='float32')
-        sr0 = sr
-        wavs.append(w)
-    wav = np.stack(wavs, axis=0)  # [C,T]
-    if sr0 != target_sr:
-        from scipy.signal import resample_poly
-        wav = resample_poly(wav, up=target_sr, down=sr0, axis=-1).astype('float32')
-    return wav
+FS_TARGET = 16000      # AmbiDrop 模型采样率
+NFFT = 512             # 必须匹配 ambidrop/asm.py apply_asm_filters 的 filt_samp=512
+SPEED_OF_SOUND = 343.0
 
+# RealMAN 原始录音采样率 (论文: 48kHz)
+FS_REALMAN = 48000
 
-def load_mono(path, target_sr=FS):
-    w, sr = sf.read(path, dtype='float32')
-    if sr != target_sr:
-        from scipy.signal import resample_poly
-        w = resample_poly(w, up=target_sr, down=sr, axis=-1).astype('float32')
-    return w
+# =====================================================================
+# 阶段1: 生成 steering 矩阵
+# =====================================================================
 
+def build_steering(ambidrop_repo: str):
+    from scipy.io import loadmat, savemat
 
-def match_len(noise, T):
-    """把噪声对齐到长度 T：不够则循环拼接，够则随机截一段"""
-    C, N = noise.shape
-    if N >= T:
-        s = np.random.randint(0, N - T + 1)
-        return noise[:, s:s + T]
-    reps = int(np.ceil(T / N))
-    return np.tile(noise, (1, reps))[:, :T]
+    grid_path = os.path.join(ambidrop_repo, "utils", "Lebvedev2702.mat")
+    assert os.path.exists(grid_path), f"找不到求积网格: {grid_path}"
 
+    grid = loadmat(grid_path)
+    th, ph = grid["th"].squeeze(), grid["ph"].squeeze()   # 极角/方位角, Q=2702
+    Q = len(th)
+    u = np.stack([np.sin(th) * np.cos(ph),
+                  np.sin(th) * np.sin(ph),
+                  np.cos(th)], axis=1)                     # (Q, 3) 方向单位向量
 
-# ---------------- 指标 ----------------
-def si_sdr(est, ref):
-    n = min(len(est), len(ref))
-    est, ref = est[:n].astype(np.float64), ref[:n].astype(np.float64)
-    alpha = np.dot(est, ref) / (np.dot(ref, ref) + 1e-12)
-    proj = alpha * ref
-    noise = est - proj
-    return 10 * np.log10(np.dot(proj, proj) / (np.dot(noise, noise) + 1e-12) + 1e-12)
+    M = MIC_POS.shape[0]
+    F_pos = NFFT // 2 + 1                                   # 257
+    freqs = np.arange(F_pos) * FS_TARGET / NFFT
 
+    V = np.zeros((M, F_pos, Q), dtype=complex)
+    for f in range(1, F_pos):                               # 跳过 DC (steering 秩1退化)
+        k = 2 * np.pi * freqs[f] / SPEED_OF_SOUND
+        V[:, f, :] = np.exp(-1j * k * (MIC_POS @ u.T))
 
-def snr(est, ref):
-    n = min(len(est), len(ref))
-    est, ref = est[:n].astype(np.float64), ref[:n].astype(np.float64)
-    noise = est - ref
-    return 10 * np.log10(np.dot(ref, ref) / (np.dot(noise, noise) + 1e-12) + 1e-12)
+    out_dir = os.path.join(ambidrop_repo, "utils", "steering")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "RealMAN9ch (simulated).mat")
+    savemat(out_path, {"V": V})
+    print(f"[steering] 已保存: {out_path}  shape={V.shape} (期望 (9, 257, 2702))")
+    print("[steering] 若推理结果方位镜像, 将 exp(-1j*...) 改为 exp(+1j*...) 重新生成本文件")
+    return out_path
 
+# =====================================================================
+# 阶段2: RealMAN -> AmbiDrop ex_* 目录结构
+# =====================================================================
+#
+# 目标结构:
+#   <out_root>/<scenario>/ex_<N>/{p.wav, s.wav, best_shift.txt}
+#     p.wav : (T, 9) 48kHz 多通道含噪语音
+#     s.wav : (T',)  16kHz 单通道干净目标 (mic0 直达声降采样)
+#
+# RealMAN 原始数据的两种常见形态, 按你的实际情况实现 fetch_one():
+#   A) 每条utterance一个多通道wav (T, 32) -> 取9列
+#   B) 每utterance每mic一个文件 xxx_micXX.wav -> 读9个文件堆叠
 
-def try_pesq(ref, est, sr):
-    try:
-        from pesq import pesq as _pesq
-        mode = 'wb' if sr == 16000 else 'nb'
-        n = min(len(est), len(ref))
-        return float(_pesq(sr, ref[:n], est[:n], mode))
-    except Exception:
-        return None  # pesq 未安装则跳过
+def find_realman_utterances(realman_root: str):
+    """返回 utterance 列表, 每个元素是 (mix_wav_path 或 [mic文件列表], direct_path, scenario_tag)"""
+    # TODO: 按你下载的 RealMAN 目录结构调整下面两行
+    speech_dir = os.path.join(realman_root, "test", "speech")        # 多通道语音目录
+    direct_dir = os.path.join(realman_root, "test", "direct_path")   # mic0 直达声目标目录
+    mix_files = sorted(glob.glob(os.path.join(speech_dir, "**", "*.wav"), recursive=True))
+    entries = []
+    for mix in mix_files:
+        utt_id = os.path.splitext(os.path.basename(mix))[0]
+        direct = os.path.join(direct_dir, utt_id + ".wav")
+        scenario = os.path.basename(os.path.dirname(mix)) or "realman"
+        if os.path.exists(direct):
+            entries.append((mix, direct, scenario))
+        else:
+            print(f"[warn] 缺直达声目标, 跳过: {utt_id}")
+    assert entries, "没有找到任何 utterance, 请检查 find_realman_utterances() 的路径配置"
+    return entries
 
+def prepare_data(realman_root: str, out_root: str, limit: int = None):
+    import soundfile as sf
+    from scipy.signal import resample_poly
 
-# ---------------- 单次 MVDR ----------------
-def run_mvdr(mix, noise, clean, mode):
-    """
-    mode='practical': target=None，导向矢量从 mix-noise 协方差估计（不偷看真值）
-    mode='oracle'   : target=clean(多通道)，导向矢量用干净目标估计（上限）
-    """
-    if mode == 'oracle':
-        if clean is None:
-            raise ValueError('oracle 模式需要多通道干净语音 target（test_raw/ma_speech）')
-        return beamformers.MVDR(mix, noise, target=clean, ref_mic=0).astype('float32')
-    else:
-        return beamformers.MVDR(mix, noise, target=None, ref_mic=0).astype('float32')
+    entries = find_realman_utterances(realman_root)
+    if limit:
+        entries = entries[:limit]
 
+    n_written = 0
+    for mix_path, direct_path, scenario in entries:
+        x, fs = sf.read(mix_path)                 # 期望 (T, C) 或 (T,)
+        if x.ndim == 1:
+            raise ValueError(f"{mix_path} 是单通道文件, 请检查是否选对多通道语音")
+        assert fs == FS_REALMAN, f"采样率 {fs} != {FS_REALMAN}"
+        x9 = x[:, :9]                             # 取前9通道 = mic 0~8, 顺序须与 MIC_POS 一致
 
-# ---------------- 单条处理 ----------------
-def process_one(speech_pat, noise_pat, ref_path, channels, out_path, modes):
-    """
-    合成一条带噪语音，按 modes 列表分别跑 MVDR，返回 {mode: 指标dict}，并保存 wav。
-    out_path 形如 xxx.wav，多模式时自动加后缀 xxx_practical.wav / xxx_oracle.wav。
-    """
-    clean = load_mc(speech_pat, channels)   # [C,T] 干净多通道语音（含混响）
-    noise = load_mc(noise_pat, channels)    # [C,T] 纯噪声
-    T = clean.shape[-1]
-    noise = match_len(noise, T)
+        s48, fs_s = sf.read(direct_path)          # mic0 直达声 (单通道)
+        assert fs_s == FS_REALMAN
+        s16 = resample_poly(s48, up=1, down=FS_REALMAN // FS_TARGET).astype(np.float32)
 
-    # 直接相加，不调电平（与官方 test 构造一致）
-    mix = clean + noise
+        ex_dir = os.path.join(out_root, scenario, f"ex_{n_written + 1}")
+        os.makedirs(ex_dir, exist_ok=True)
+        sf.write(os.path.join(ex_dir, "p.wav"), x9, FS_REALMAN, subtype="FLOAT")
+        sf.write(os.path.join(ex_dir, "s.wav"), s16, FS_TARGET, subtype="FLOAT")
+        with open(os.path.join(ex_dir, "best_shift.txt"), "w") as f:
+            f.write("0")                          # 占位即可, 主流程用互相关重新对齐
 
-    # 真值（mic0 直达声），两种模式共用
-    ref = load_mono(ref_path)
+        n_written += 1
+        if n_written % 50 == 0:
+            print(f"[data] 已处理 {n_written}/{len(entries)}")
 
-    base, ext = os.path.splitext(out_path)
-    results = {}
-    for mode in modes:
-        out = run_mvdr(mix, noise, clean, mode)
-        op = f"{base}_{mode}{ext}" if len(modes) > 1 else out_path
-        os.makedirs(os.path.dirname(op) or '.', exist_ok=True)
-        sf.write(op, out, FS)
-        results[mode] = {
-            'SI_SDR': float(si_sdr(out, ref)),
-            'SNR': float(snr(out, ref)),
-            'PESQ': try_pesq(ref, out, FS),
-            'wav': op,
-        }
-    return results
+    print(f"[data] 完成: {n_written} 条 -> {out_root}")
+    print("[data] 提示: s.wav (直达声) 与模型输出 A00 差 1/sqrt(4π) 幅度, 但指标均幅度不变, 无需处理")
 
+# =====================================================================
+# 阶段3: 推理
+# =====================================================================
 
-# ---------------- 主流程 ----------------
-def parse_channels(s):
-    if '-' in s:
-        a, b = s.split('-')
-        return list(range(int(a), int(b) + 1))
-    return [int(x) for x in s.split(',')]
+def run_inference(ambidrop_repo: str, out_root: str, steering_path: str,
+                  scenarios=None, regularization="tikhonov", dry_run=True):
+    cmd = [
+        sys.executable, os.path.join(ambidrop_repo, "run_Real_World.py"),
+        "--atf", "simulated",
+        "--steering-path", steering_path,
+        "--grid-path", os.path.join(ambidrop_repo, "utils", "Lebvedev2702.mat"),
+        "--aria-data-dir", out_root,
+        "--ref-mic", "1",
+        "--regularization", regularization,
+        "--output-csv", os.path.join(out_root, "results.csv"),
+    ]
+    if scenarios:
+        cmd += ["--scenarios"] + list(scenarios)
+    print("[run] 执行命令:")
+    print("      " + " ".join(cmd))
+    if dry_run:
+        print("[run] dry-run 模式, 去掉 --dry-run 实际执行")
+        return
+    subprocess.run(cmd, cwd=ambidrop_repo, check=True)
 
+# =====================================================================
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--speech_pat', required=True, help='test_raw ma_speech 路径模板，含 {ch}')
-    ap.add_argument('--noise_pat', required=True, help='test_raw ma_noise 路径模板，含 {ch}（同场景）')
-    ap.add_argument('--ref', required=True, help='test dp_speech 单通道真值（mic0）路径')
-    ap.add_argument('--out', required=True, help='增强结果保存路径 .wav（多模式自动加后缀）')
-    ap.add_argument('--channels', default='0-31', help='如 0-31 或 0,1,2,3')
-    ap.add_argument('--mode', default='both',
-                    choices=['practical', 'oracle', 'both'],
-                    help='practical=混合-噪声协方差估计(实用)；oracle=干净目标估计(上限)；both=两者都跑')
-    args = ap.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--step", choices=["steering", "data", "run", "all"], default="all")
+    p.add_argument("--ambidrop-repo", required=True, help="AmbiDrop 仓库根目录")
+    p.add_argument("--realman-root", default=None, help="RealMAN 数据集根目录 (阶段2需要)")
+    p.add_argument("--out-root", default=None, help="评测数据输出目录 (阶段2/3)")
+    p.add_argument("--limit", type=int, default=None, help="只处理前N条(调试用)")
+    p.add_argument("--regularization", choices=["tikhonov", "svd"], default="tikhonov")
+    p.add_argument("--scenarios", nargs="+", default=None)
+    p.add_argument("--dry-run", action="store_true")
+    args = p.parse_args()
 
-    channels = parse_channels(args.channels)
-    modes = ['practical', 'oracle'] if args.mode == 'both' else [args.mode]
+    steering_path = os.path.join(args.ambidrop_repo, "utils", "steering",
+                                 "RealMAN9ch (simulated).mat")
 
-    results = process_one(args.speech_pat, args.noise_pat, args.ref, channels, args.out, modes)
+    if args.step in ("steering", "all"):
+        build_steering(args.ambidrop_repo)
 
-    print('\n================ MVDR 结果 ================')
-    for mode, r in results.items():
-        pesq = f"{r['PESQ']:.3f}" if r['PESQ'] is not None else 'N/A(未装pesq)'
-        print(f"[{mode:9s}] SI-SDR={r['SI_SDR']:6.2f} dB | SNR={r['SNR']:6.2f} dB | PESQ={pesq} | wav -> {r['wav']}")
-    if 'practical' in results and 'oracle' in results:
-        gap = results['oracle']['SI_SDR'] - results['practical']['SI_SDR']
-        print(f"\n导向矢量估计差距(oracle-practical) = {gap:.2f} dB "
-              f"({'瓶颈在导向矢量估计' if gap > 1.5 else '瓶颈偏向 MVDR 方法本身'})")
+    if args.step in ("data", "all"):
+        assert args.realman_root and args.out_root, "阶段2需要 --realman-root 和 --out-root"
+        prepare_data(args.realman_root, args.out_root, limit=args.limit)
 
+    if args.step in ("run", "all"):
+        out_root = args.out_root or os.path.join(args.ambidrop_repo, "datasets", "realman_eval")
+        run_inference(args.ambidrop_repo, out_root, steering_path,
+                      scenarios=args.scenarios,
+                      regularization=args.regularization,
+                      dry_run=args.dry_run)
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
